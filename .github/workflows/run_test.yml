@@ -37,7 +37,7 @@ jobs:
         run: pip install -e .[test]
 
       - name: Run test suite
-        run: pytest -s -vv --cov --cov-config=pyproject.toml --cov-report=xml
+        run: coverage run -m pytest -s -vv
 
       - name: Publish coverage
         uses: codecov/codecov-action@v4

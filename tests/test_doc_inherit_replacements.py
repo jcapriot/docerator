@@ -176,7 +176,7 @@ def test_grandchild_docerator_meta():
     arg1 : object
         Extended Description.
     a_new_arg : dict
-        Still a dictionary..
+        Still a dictionary...
     arg2 : int
         2 Extended Description.
 

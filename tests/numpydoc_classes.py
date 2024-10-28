@@ -45,13 +45,13 @@ class GrandchildClass(
         "but_not_too_much",
     },
 ):
-    __doc__ = f"""Docstring
+    """Docstring
 
     Parameters
     ----------
     %(numpydoc_classes.Parent.arg1)
     a_new_arg : dict
-        Still a dictionary..
+        Still a dictionary...
     %(super.arg2)
 
     Other Parameters

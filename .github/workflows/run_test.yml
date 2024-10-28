@@ -1,0 +1,38 @@
+name: Run Tests
+
+on:
+  push:
+    branches:
+      - '*'
+  pull_request:
+    branches:
+      - 'main'
+
+jobs:
+  run_tests:
+    name: Testing with python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash -l {0}
+    matrix:
+      os: ['ubuntu-latest']
+      python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+
+  steps:
+    - uses: actions/checkout@v4
+      name: Checkout repository
+      with:
+        fetch-depth: 0
+
+    - uses: actions/setup-python@v5
+      name: Setup python ${{ matrix.python-version }}
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip' # caching pip dependencies
+
+    - name: Install package and testing dependencies
+      run: pip install -e .[test]
+
+    - name: Run test suite
+      run: pytest -s -vv

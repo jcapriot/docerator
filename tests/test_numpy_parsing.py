@@ -461,7 +461,6 @@ def test_class_doc_with_extra_arg(debug):
             not_in_signature=DescribedParameter(
                 name="not_in_signature",
                 kind=Parameter.KEYWORD_ONLY,
-                default=None,
                 type_description="object",
                 long_description="This argument is not explicitly in this class's call signature."
             )

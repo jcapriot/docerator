@@ -20,6 +20,10 @@ def import_from_path(module_name, file_path):
 
 py313 = sys.version_info >= (3, 13)
 
+def py313_docstrip(text):
+    text=text.split("\n", maxsplit=1)
+    return "\n".join([text[0].strip(), textwrap.dedent(text[1])])
+
 numpydoc_classes = import_from_path('numpydoc', pathlib.Path(__file__).parent / "numpydoc_classes.py")
 Parent = numpydoc_classes.Parent
 ChildClass = numpydoc_classes.ChildClass
@@ -99,8 +103,7 @@ def test_nothing_to_insert():
     )
 
     if py313:
-        docstring = docstring.split("\n", 1)
-        docstring = "\n".join([docstring[0], textwrap.dedent(docstring[1])])
+        docstring = py313_docstrip(docstring)
     assert (Parent.__doc__, inspect.signature(Parent.__init__)) == (docstring, init_sig)
 
 
@@ -157,7 +160,7 @@ def test_child_docerator_meta():
     )
 
     if py313:
-        docstring = textwrap.dedent(docstring)
+        docstring = py313_docstrip(docstring)
 
     assert (ChildClass.__doc__, inspect.signature(ChildClass.__init__)) == (
         docstring,
@@ -184,8 +187,9 @@ def test_grandchild_docerator_meta():
 
     even_more : list
     """
+
     if py313:
-        docstring = textwrap.dedent(docstring)
+        docstring = py313_docstrip(docstring)
 
     init_sig = inspect.Signature(
         parameters=[

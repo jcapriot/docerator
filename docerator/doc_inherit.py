@@ -3,7 +3,7 @@ import re
 import importlib
 import functools
 import textwrap
-from typing import Callable, Optional, Any
+from typing import Callable, Optional
 
 __all__ = ["bind_signature_to_function"]
 

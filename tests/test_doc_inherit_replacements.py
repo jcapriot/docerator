@@ -17,6 +17,8 @@ def import_from_path(module_name, file_path):
     spec.loader.exec_module(module)
     return module
 
+cleandoc = sys.version_info[0] >= 3 and sys.version_info[1] >= 13
+
 numpydoc_classes = import_from_path('numpydoc', pathlib.Path(__file__).parent / "numpydoc_classes.py")
 Parent = numpydoc_classes.Parent
 ChildClass = numpydoc_classes.ChildClass
@@ -83,6 +85,8 @@ def test_nothing_to_insert():
     but_not_too_much
         But another description.
     """
+    if cleandoc:
+        docstring = inspect.cleandoc(docstring)
 
     init_sig = inspect.Signature(
         parameters=[
@@ -118,6 +122,9 @@ def test_child_docerator_meta():
     but_not_too_much
         But another description.
     """
+
+    if cleandoc:
+        docstring = inspect.cleandoc(docstring)
 
     init_sig = inspect.Signature(
         parameters=[
@@ -174,6 +181,8 @@ def test_grandchild_docerator_meta():
 
     even_more : list
     """
+    if cleandoc:
+        docstring = inspect.cleandoc(docstring)
 
     init_sig = inspect.Signature(
         parameters=[

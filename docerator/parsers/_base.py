@@ -1,6 +1,6 @@
 import inspect
 import abc
-from typing import Any
+from typing import Any, Optional, Union
 
 from docerator import get_debug_level, DoceratorParsingError
 from docerator._params import DescribedParameter
@@ -10,12 +10,12 @@ class ParameterParser(metaclass=abc.ABCMeta):
 
     @classmethod
     @abc.abstractmethod
-    def doc_parameter_parser(cls, docstring: str) -> dict[str, tuple[str|None, str|None]]:
+    def doc_parameter_parser(cls, docstring: str) -> dict[str, tuple[Optional[str], Optional[str]]]:
         ...
 
     @classmethod
     @abc.abstractmethod
-    def format_parameter(cls, param: DescribedParameter) -> str:
+    def format_parameter(cls, param: Union[DescribedParameter, list[DescribedParameter]]) -> str:
         ...
 
     @classmethod

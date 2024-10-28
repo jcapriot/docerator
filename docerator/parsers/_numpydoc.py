@@ -2,6 +2,7 @@ import inspect
 import itertools
 import re
 import textwrap
+from typing import Optional, Union
 
 from docerator import get_debug_level, DoceratorParsingError
 from docerator._base import REPLACE_REGEX
@@ -57,7 +58,7 @@ def _pairwise(iterable):
 class NumpydocParser(ParameterParser):
 
     @classmethod
-    def doc_parameter_parser(cls, docstring: str) -> dict[str, tuple[str|None, str|None]]:
+    def doc_parameter_parser(cls, docstring: str) -> dict[str, tuple[Optional[str], Optional[str]]]:
 
         """Parse a numpydoc string for parameter descriptions.
 
@@ -127,7 +128,7 @@ class NumpydocParser(ParameterParser):
 
 
     @classmethod
-    def format_parameter(cls, param: DescribedParameter|list[DescribedParameter]) -> str:
+    def format_parameter(cls, param: Union[DescribedParameter, list[DescribedParameter]]) -> str:
         # If param is an iterator, all parameters will have the same type description and long description
         if isinstance(param, DescribedParameter):
             param = [param]

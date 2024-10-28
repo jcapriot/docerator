@@ -7,7 +7,7 @@ from typing import Callable, Optional
 
 __all__ = ["bind_signature_to_function"]
 
-from docerator._base import REPLACE_REGEX, REPLACE_STAR_REGEX
+from docerator._base import REPLACE_REGEX
 from docerator.parsers import PARSERS, ParameterParser
 
 ARG_SPLIT_REGEX = re.compile(r"\s*,\s*")

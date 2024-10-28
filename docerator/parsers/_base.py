@@ -50,7 +50,7 @@ class ParameterParser(metaclass=abc.ABCMeta):
                 )
             # otherwise add an argument with few no details about its default value or annotation.
             param = DescribedParameter(
-                name, kind=inspect.Parameter.KEYWORD_ONLY, default=None,
+                name, kind=inspect.Parameter.KEYWORD_ONLY,
                 type_description=description[0], long_description=description[1]
             )
             out_dict[name] = param

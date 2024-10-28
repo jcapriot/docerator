@@ -2,7 +2,6 @@
 import re
 
 REPLACE_REGEX = re.compile(r"%\((?P<replace_key>.*)\)")
-REPLACE_STAR_REGEX = re.compile(r"%\((?P<class_name>\S+)\.\*\)")
 REPLACE_ARG_SPLIT_REGEX = re.compile(r"\s*,\s*")
 
 class DocstringInheritWarning(ImportWarning):

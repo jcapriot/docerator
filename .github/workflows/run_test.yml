@@ -37,4 +37,11 @@ jobs:
         run: pip install -e .[test]
 
       - name: Run test suite
-        run: pytest -s -vv
+        run: pytest -s -vv --cov --cov-config=pyproject.toml --cov-report=xml
+
+      - name: Publish coverage
+        uses: codecov/codecov-action@v4
+        with:
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true

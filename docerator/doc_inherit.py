@@ -12,17 +12,32 @@ from docerator.parsers import PARSERS, ParameterParser
 
 ARG_SPLIT_REGEX = re.compile(r"\s*,\s*")
 
-def _skip_first():
+def _skip_first_and_empty():
     _first_call = True
-    def func(*args, **kwargs):
+    def func(input):
         nonlocal _first_call
         result = not _first_call
         _first_call = False
+        if input.isspace():
+            return False
         return result
 
-def _get_indent(target, docstring):
+    return func
+
+def _get_indent(target: str, docstring: str):
     # Return the indentation between target and the new line character before it.
     return re.search(rf"^\s*(?={re.escape(target)})", docstring, re.MULTILINE)[0]
+
+
+def _replace_doc_args(replace_key: str, replacement: str, doc: str):
+    # find the indentation
+    target = f"%({replace_key})"
+    indent = _get_indent(target, doc)
+
+    # prepend indent to all lines except the first
+    formatted = textwrap.indent(replacement, indent, _skip_first_and_empty())
+    return doc.replace(target, formatted)
+
 
 def _doc_wrap(
         func: Callable,
@@ -34,11 +49,12 @@ def _doc_wrap(
     doc = func.__doc__
     if inspect.isclass(func):
         func = func.__init__
-    if inspect.isfunction(func):
+        func_name = "__init__"
+    elif inspect.isfunction(func):
         func_name = func.__name__
     else:
         raise TypeError(
-            "must wrap a class or function"
+            f"must wrap a class or function, got a {type(func)}"
         )
     if not doc:
         return func
@@ -52,9 +68,10 @@ def _doc_wrap(
         replace_key = match.group("replace_key")
         args = []
         for item in ARG_SPLIT_REGEX.split(replace_key):
-            args.append(item.rsplit(".", 1))
-            had_super = args[0] == 'super'
-            had_star = args[1] == '*'
+            item = item.rsplit(".", 1)
+            args.append(item)
+            had_super |= item[0] == 'super'
+            had_star |= item[1] == '*'
         args_to_insert[replace_key] = args
 
     if not args_to_insert:
@@ -123,14 +140,7 @@ def _doc_wrap(
                 parameters.append(arg_dict[arg])
         if parameters:
             formatted = parser.format_parameter(parameters)
-
-            # find the indentation
-            target = f"%({replace_key})"
-            indent = _get_indent(target, doc)
-
-            # preprend indent to all lines except the first
-            formatted = textwrap.indent(formatted, indent, _skip_first())
-            doc = doc.replace(target, formatted)
+            doc = _replace_doc_args(replace_key, formatted, doc)
             for param in parameters:
                 inserted_parameters[param.name] = param
 
@@ -169,17 +179,13 @@ def _doc_wrap(
                 ):
                     parameters.append(param)
 
-        # build up the replacement string
-        formatted = "\n".join(parser.format_parameter(par) for par in parameters)
+        if parameters:
+            # build up the replacement string
+            formatted = "\n".join(parser.format_parameter(par) for par in parameters)
+            doc = _replace_doc_args(replace_key, formatted, doc)
 
-        target = f"%({replace_key})",
-        indent = _get_indent(target, doc)
-
-        formatted = textwrap.indent(formatted, indent, _skip_first())
-        doc = doc.replace(target, formatted)
-
-        for param in parameters:
-            inserted_parameters[param.name] = param
+            for param in parameters:
+                inserted_parameters[param.name] = param
 
     signature = inspect.signature(func)
     if update_signature:
@@ -189,15 +195,19 @@ def _doc_wrap(
         # filter out the variational keyword argument
         for arg, param in parameters.items():
             if param.kind == inspect.Parameter.VAR_KEYWORD:
-                var_kwarg = (arg, param)
+                var_kwarg = param
+            elif param.name in star_excludes:
+                # if this parameter was meant to be excluded, skip over it.
+                continue
             else:
                 if param.name in inserted_parameters:
                     # update it with the inherited parameters
                     # and be sure not to change the kind of the parameter
                     # or its default
                     param = inserted_parameters[param.name].replace(kind=param.kind, default=param.default)
+
                 new_params.append(param)
-        for param in inserted_parameters:
+        for param in inserted_parameters.values():
             if param.name not in parameters and var_kwarg:
                 new_params.append(
                     param.replace(kind=inspect.Parameter.KEYWORD_ONLY)
@@ -364,12 +374,14 @@ class DoceratorMeta(type):
         for item_name, item in namespace.items():
             if item_name in ["__module__", "__qualname__", "__doc__"]:
                 continue
-            arguments[item_name] = parser.parse_parameters(item)
+            # only work with callable things (that have a signature)
+            if inspect.ismethod(item) or inspect.isfunction(item):
+                arguments[item_name] = parser.parse_parameters(item)
         # If this class has a `__doc__` parse its parameters (if any)
         # and add them to __init__
         if "__doc__" in namespace:
             init = arguments.get("__init__", {})
-            arguments["__init__"] = init.update(parser.parse_parameters(cls))
+            arguments["__init__"] = init | parser.parse_parameters(cls)
 
         cls._arg_dict = arguments
 
@@ -409,11 +421,15 @@ class DoceratorMeta(type):
 
         if "__doc__" in namespace:
             new_init = _doc_wrap(cls, star_excludes, parser, cls, update_signature)
-            cls.__old_doc = cls.__doc__
-            cls.__doc__ = new_init.__doc__
-            new_init.__doc__ = None
-            if "__init__" in namespace and update_signature:
-                cls.__init__ = new_init
+            # skip if _doc_wrap didn't do anything...
+            if new_init is not cls.__init__:
+                cls.__old_doc = cls.__doc__
+                cls.__doc__ = new_init.__doc__
+                if update_signature:
+                    # If I had an __init__ method, it would've been modified above
+                    # so pull it's docstring into this function.
+                    new_init.__doc__ = None
+                    cls.__init__ = new_init
 
         return cls
 

@@ -2,9 +2,6 @@ import inspect
 import itertools
 import re
 import textwrap
-from collections import OrderedDict
-from collections.abc import Iterator
-from typing import Optional
 
 from docerator import get_debug_level, DoceratorParsingError
 from docerator._base import REPLACE_REGEX
@@ -70,7 +67,7 @@ class NumpydocParser(ParameterParser):
 
         Returns
         -------
-        OrderedDict[str, tuple[str|None, str|None]]
+        dict[str, tuple[str|None, str|None]]
             A dictionary indexed by arguments found in the docstring pointing to their
              type descriptions and long descriptions.
         """
@@ -97,7 +94,7 @@ class NumpydocParser(ParameterParser):
         if others:
             parameters += "\n" + others
 
-        out_dict = OrderedDict()
+        out_dict = {}
         matches = False
         for match, next_match in _pairwise(NUMPY_ARG_TYPE_REGEX.finditer(parameters)):
             matches = True
@@ -134,8 +131,12 @@ class NumpydocParser(ParameterParser):
         # If param is an iterator, all parameters will have the same type description and long description
         if isinstance(param, DescribedParameter):
             param = [param]
-        name = ",".join([par.name for par in param])
-        long_description = textwrap.indent(param[0].long_description, "    ")
-
-        formatted = f"{name} : {param[0].type_description}\n{long_description}"
+        if len(param) == 0:
+            raise ValueError("param cannot be an empty list.")
+        formatted = ", ".join([par.name for par in param])
+        if param[0].type_description is not None:
+            formatted += f" : {param[0].type_description}"
+        if param[0].long_description is not None:
+            long_description = textwrap.indent(param[0].long_description, "    ")
+            formatted += f"\n{long_description}"
         return formatted

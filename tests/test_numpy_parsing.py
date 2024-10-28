@@ -1,4 +1,3 @@
-import collections
 import inspect
 from inspect import Parameter
 
@@ -7,6 +6,7 @@ import pytest
 import docerator
 import docerator._base as doc_base
 import docerator.parsers._numpydoc as np_doc
+from docerator._params import DescribedParameter
 
 
 @pytest.fixture
@@ -50,7 +50,8 @@ def param_references():
         "item5",
         "item6",
         "item7",
-        "multiple, args",
+        "multiple",
+        "args",
     ]
 
     arg_types = [
@@ -63,6 +64,7 @@ def param_references():
         "type",
         "type",
         "shared type",
+        "shared type",
     ]
     arg_descriptions = [
         None,
@@ -74,21 +76,13 @@ def param_references():
         "    I've got a description line\n\n    that has an empty line in it.",
         "    I've got a description line\n    that ends with an empty line.\n",
         "    Shared Description\n",
+        "    Shared Description\n",
     ]
-    # if expand_shared:
-    #     updated_names = []
-    #     updates_types = []
-    #     updated_descs = []
-    #     for args, typ, desc in zip(arg_names, arg_types, arg_descriptions):
-    #         for arg in doc_inherit.ARG_SPLIT_REGEX.split(args):
-    #             updated_names.append(arg)
-    #             updates_types.append(typ)
-    #             updated_descs.append(desc)
-    #     arg_names = updated_names
-    #     arg_types = updates_types
-    #     arg_descriptions = updated_descs
+    out = {}
+    for arg, arg_type, arg_description in zip(arg_names, arg_types, arg_descriptions):
+        out[arg] = (arg_type, arg_description)
 
-    return arg_names, arg_types, arg_descriptions
+    return out
 
 
 @pytest.mark.parametrize(
@@ -213,8 +207,6 @@ def test_numpydoc_section_parsing():
 
 def test_numpy_argtype_regex_within_section_contents(param_section, param_references):
     # Create a parameter section as it would be output by the
-    # doc_inherit.NUMPY_SECTION_REGEX
-    arg_names, arg_types, _ = param_references
 
     def tester(match):
         arg, type_string = match.groups()
@@ -227,10 +219,12 @@ def test_numpy_argtype_regex_within_section_contents(param_section, param_refere
     matches = list(
         filter(tester, np_doc.NUMPY_ARG_TYPE_REGEX.finditer(param_section))
     )
-    assert len(matches) == len(arg_names)
-    for match, ref_arg, ref_type in zip(matches, arg_names, arg_types):
-        arg, type_string = match.groups()
-        assert (arg, type_string) == (ref_arg, ref_type)
+    assert len(matches) == 9  # should find the 9 matches
+    for match in matches:
+        args, type_string = match.groups()
+        for arg in np_doc.NUMPY_ARG_SPLIT_REGEX.split(args):
+            assert arg in param_references
+            assert param_references[arg][0] == type_string
 
 
 @pytest.mark.parametrize("section_split", ["parameters", "both"])
@@ -278,12 +272,7 @@ def test_parse_numpydoc_parameters(param_section, param_references, section_spli
 
     parsed = np_doc.NumpydocParser.doc_parameter_parser(doc)
 
-    reference_items = []
-    for name, typ, desc in zip(*param_references):
-        # need to split arguments with a shared type and description.
-        for arg in NUMPY_ARG_SPLIT_REGEX.ARG_SPLIT_REGEX.split(name):
-            reference_items.append((arg, typ, desc))
-    assert parsed == reference_items
+    assert parsed == param_references
 
 
 def test_parse_numpydoc_no_parameters():
@@ -315,22 +304,25 @@ def test_class_npdoc_parsing():
 
     doc_dict = np_doc.NumpydocParser.parse_parameters(TestClass)
 
-    verify_dict = collections.OrderedDict(
-        item={
-            "type_string": "object",
-            "description": "    Could be anything really...",
-            "parameter": Parameter(name="item", kind=Parameter.POSITIONAL_OR_KEYWORD),
-        },
-        a={
-            "type_string": "float",
-            "description": "    Two numbers to store on the class",
-            "parameter": Parameter(name="a", kind=Parameter.POSITIONAL_OR_KEYWORD),
-        },
-        b={
-            "type_string": "float",
-            "description": "    Two numbers to store on the class",
-            "parameter": Parameter(name="b", kind=Parameter.POSITIONAL_OR_KEYWORD),
-        },
+    verify_dict = dict(
+        item=DescribedParameter(
+            name="item",
+            kind=Parameter.POSITIONAL_OR_KEYWORD,
+            type_description="object",
+            long_description='Could be anything really...'
+        ),
+        a=DescribedParameter(
+            name="a",
+            kind=Parameter.POSITIONAL_OR_KEYWORD,
+            type_description="float",
+            long_description='Two numbers to store on the class'
+        ),
+        b=DescribedParameter(
+            name="b",
+            kind=Parameter.POSITIONAL_OR_KEYWORD,
+            type_description="float",
+            long_description='Two numbers to store on the class'
+        )
     )
     assert verify_dict == doc_dict
 
@@ -348,11 +340,11 @@ def test_parse_numpydoc_hyphen_errors(section, dash_length, debug):
     if debug:
         match = f"(Unable to parse docstring for {section.lower()}).*"
         with pytest.raises(docerator.DoceratorParsingError, match=match):
-            list(docerator._parse_numpydoc_parameters(docstring))
+            np_doc.NumpydocParser.doc_parameter_parser(docstring)
     else:
         # Shouldn't throw if no debug
-        list(doc_inherit._parse_numpydoc_parameters(docstring))
-    doc_inherit.set_debug_level(0)
+        np_doc.NumpydocParser.doc_parameter_parser(docstring)
+    docerator.set_debug_level(0)
 
 
 @pytest.mark.parametrize("debug", [0, 1])
@@ -371,16 +363,15 @@ def test_bad_section_order(debug):
     -------
     """
 
-    doc_inherit.set_debug_level(debug)
+    docerator.set_debug_level(debug)
     if debug:
         match = "(Unable to parse docstring for parameters).*"
-        with pytest.raises(doc_inherit.DoceratorParsingError, match=match):
-            list(doc_inherit._parse_numpydoc_parameters(docstring))
+        with pytest.raises(docerator.DoceratorParsingError, match=match):
+            np_doc.NumpydocParser.doc_parameter_parser(docstring)
     else:
-        # Shouldn't throw if no debug
-        list(doc_inherit._parse_numpydoc_parameters(docstring))
+        np_doc.NumpydocParser.doc_parameter_parser(docstring)
 
-    doc_inherit.set_debug_level(0)
+    docerator.set_debug_level(0)
 
 
 @pytest.mark.parametrize("debug", [0, 1])
@@ -394,16 +385,16 @@ def test_bad_section_indent(debug):
     -------
     """
 
-    doc_inherit.set_debug_level(debug)
+    docerator.set_debug_level(debug)
     if debug:
         match = "(Unable to parse docstring for parameters).*"
-        with pytest.raises(doc_inherit.DoceratorParsingError, match=match):
-            list(doc_inherit._parse_numpydoc_parameters(docstring))
+        with pytest.raises(docerator.DoceratorParsingError, match=match):
+            np_doc.NumpydocParser.doc_parameter_parser(docstring)
     else:
         # Shouldn't throw if no debug
-        assert list(doc_inherit._parse_numpydoc_parameters(docstring)) == []
+        assert np_doc.NumpydocParser.doc_parameter_parser(docstring) == {}
 
-    doc_inherit.set_debug_level(0)
+    docerator.set_debug_level(0)
 
 
 @pytest.mark.parametrize("debug", [0, 1])
@@ -415,14 +406,14 @@ def test_unparseable_parameters(debug):
     """
     match = "(Did not find any documented arguments in any parameter).*"
 
-    doc_inherit.set_debug_level(debug)
+    docerator.set_debug_level(debug)
     if debug:
-        with pytest.raises(doc_inherit.DoceratorParsingError, match=match):
-            list(doc_inherit._parse_numpydoc_parameters(docstring))
+        with pytest.raises(docerator.DoceratorParsingError, match=match):
+            np_doc.NumpydocParser.doc_parameter_parser(docstring)
     else:
         # Shouldn't throw if no debug
-        assert list(doc_inherit._parse_numpydoc_parameters(docstring)) == []
-    doc_inherit.set_debug_level(0)
+        assert np_doc.NumpydocParser.doc_parameter_parser(docstring) == {}
+    docerator.set_debug_level(0)
 
 
 @pytest.mark.parametrize("debug", [0, 1])
@@ -442,38 +433,39 @@ def test_class_doc_with_extra_arg(debug):
 
         def __init__(self, item, a, b, **kwargs): ...
 
-    doc_inherit.set_debug_level(debug)
+    docerator.set_debug_level(debug)
     if debug:
-        match = "Documented argument not_in_signature, is not in the signature of TestClass.__init__"
-        with pytest.raises(doc_inherit.DoceratorParsingError, match=match):
-            doc_inherit._class_arg_doc_dict(TestClass)
+        match = "Documented argument not_in_signature is not in the signature of TestClass"
+        with pytest.raises(docerator.DoceratorParsingError, match=match):
+            np_doc.NumpydocParser.parse_parameters(TestClass)
     else:
-        verify_dict = collections.OrderedDict(
-            item={
-                "type_string": "object",
-                "description": "    Could be anything really...",
-                "parameter": Parameter(
-                    name="item", kind=Parameter.POSITIONAL_OR_KEYWORD
-                ),
-            },
-            a={
-                "type_string": "float",
-                "description": "    Two numbers to store on the class",
-                "parameter": Parameter(name="a", kind=Parameter.POSITIONAL_OR_KEYWORD),
-            },
-            b={
-                "type_string": "float",
-                "description": "    Two numbers to store on the class",
-                "parameter": Parameter(name="b", kind=Parameter.POSITIONAL_OR_KEYWORD),
-            },
-            not_in_signature={
-                "type_string": "object",
-                "description": "    This argument is not explicitly in this class's call signature.",
-                "parameter": Parameter(
-                    name="not_in_signature", default=None, kind=Parameter.KEYWORD_ONLY
-                ),
-            },
+        verify_dict = dict(
+            item=DescribedParameter(
+                name="item",
+                kind=Parameter.POSITIONAL_OR_KEYWORD,
+                type_description="object",
+                long_description='Could be anything really...'
+            ),
+            a=DescribedParameter(
+                name="a",
+                kind=Parameter.POSITIONAL_OR_KEYWORD,
+                type_description="float",
+                long_description='Two numbers to store on the class'
+            ),
+            b=DescribedParameter(
+                name="b",
+                kind=Parameter.POSITIONAL_OR_KEYWORD,
+                type_description="float",
+                long_description='Two numbers to store on the class'
+            ),
+            not_in_signature=DescribedParameter(
+                name="not_in_signature",
+                kind=Parameter.KEYWORD_ONLY,
+                default=None,
+                type_description="object",
+                long_description="This argument is not explicitly in this class's call signature."
+            )
         )
         # Shouldn't throw if no debug
-        assert doc_inherit._class_arg_doc_dict(TestClass) == verify_dict
-    doc_inherit.set_debug_level(0)
+        assert np_doc.NumpydocParser.parse_parameters(TestClass) == verify_dict
+    docerator.set_debug_level(0)

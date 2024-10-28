@@ -1,5 +1,4 @@
 import inspect
-from collections import OrderedDict
 import abc
 from typing import Any
 
@@ -11,7 +10,7 @@ class ParameterParser(metaclass=abc.ABCMeta):
 
     @classmethod
     @abc.abstractmethod
-    def doc_parameter_parser(cls, docstring: str) -> OrderedDict[str, tuple[str|None, str|None]]:
+    def doc_parameter_parser(cls, docstring: str) -> dict[str, tuple[str|None, str|None]]:
         ...
 
     @classmethod
@@ -20,14 +19,15 @@ class ParameterParser(metaclass=abc.ABCMeta):
         ...
 
     @classmethod
-    def parse_parameters(cls, method: Any) -> OrderedDict[str, DescribedParameter]:
+    def parse_parameters(cls, method: Any) -> dict[str, DescribedParameter]:
 
         docstring = method.__doc__
         # build a dictionary of argument names and their corresponding Parameter
-        out_dict = OrderedDict()
+        out_dict = {}
         if not docstring:
             return out_dict
         described_params = cls.doc_parameter_parser(docstring)
+
         signature = inspect.signature(method)
         func_params = signature.parameters
 
@@ -46,7 +46,7 @@ class ParameterParser(metaclass=abc.ABCMeta):
             # If I'm debugging and there are leftover described parameters, emit an error
             if debug_level:
                 raise DoceratorParsingError(
-                    f"Documented argument {name}, is not in the signature of {func_params.__name__}"
+                    f"Documented argument {name} is not in the signature of {method.__name__}"
                 )
             # otherwise add an argument with few no details about its default value or annotation.
             param = DescribedParameter(

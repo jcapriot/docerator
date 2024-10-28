@@ -1,5 +1,6 @@
 import inspect
 import pathlib
+import textwrap
 from inspect import Parameter
 import pytest
 import docerator
@@ -17,7 +18,7 @@ def import_from_path(module_name, file_path):
     spec.loader.exec_module(module)
     return module
 
-cleandoc = sys.version_info[0] >= 3 and sys.version_info[1] >= 13
+py313 = sys.version_info >= (3, 13)
 
 numpydoc_classes = import_from_path('numpydoc', pathlib.Path(__file__).parent / "numpydoc_classes.py")
 Parent = numpydoc_classes.Parent
@@ -85,8 +86,6 @@ def test_nothing_to_insert():
     but_not_too_much
         But another description.
     """
-    if cleandoc:
-        docstring = inspect.cleandoc(docstring)
 
     init_sig = inspect.Signature(
         parameters=[
@@ -98,6 +97,10 @@ def test_nothing_to_insert():
             Parameter(name="but_not_too_much", kind=Parameter.POSITIONAL_OR_KEYWORD),
         ]
     )
+
+    if py313:
+        docstring = docstring.split("\n", 1)
+        docstring = "\n".join([docstring[0], textwrap.dedent(docstring[1])])
     assert (Parent.__doc__, inspect.signature(Parent.__init__)) == (docstring, init_sig)
 
 
@@ -122,9 +125,6 @@ def test_child_docerator_meta():
     but_not_too_much
         But another description.
     """
-
-    if cleandoc:
-        docstring = inspect.cleandoc(docstring)
 
     init_sig = inspect.Signature(
         parameters=[
@@ -156,6 +156,9 @@ def test_child_docerator_meta():
         ]
     )
 
+    if py313:
+        docstring = textwrap.dedent(docstring)
+
     assert (ChildClass.__doc__, inspect.signature(ChildClass.__init__)) == (
         docstring,
         init_sig,
@@ -181,8 +184,8 @@ def test_grandchild_docerator_meta():
 
     even_more : list
     """
-    if cleandoc:
-        docstring = inspect.cleandoc(docstring)
+    if py313:
+        docstring = textwrap.dedent(docstring)
 
     init_sig = inspect.Signature(
         parameters=[

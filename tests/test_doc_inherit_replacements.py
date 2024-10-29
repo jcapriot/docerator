@@ -6,6 +6,8 @@ import pytest
 import docerator
 import sys
 import importlib.util
+
+from docerator import bind_signature_to_function
 from docerator._params import DescribedParameter
 from docerator.parsers import NumpydocParser
 import docerator.doc_inherit as doc_inherit
@@ -383,3 +385,90 @@ def test_cousin_another_method_replace():
 
     assert CousinClass.another_func.__doc__ == func_string
     assert inspect.signature(CousinClass.another_func) == func_sig
+
+@pytest.mark.parametrize('update_signature', [True, False])
+def test_func_wrapper(update_signature):
+    @docerator.doc_wrap(update_signature=update_signature)
+    def npdoc_function(whats_this):
+        """I'm going to grab my parameter description
+
+        Parameters
+        ----------
+        %(numpydoc_classes.Parent.a_function.whats_this)
+        """
+
+    docstring = """I'm going to grab my parameter description
+
+        Parameters
+        ----------
+        whats_this : str
+            The string.
+        """
+
+    if py313:
+        docstring = py313_docstrip(docstring)
+
+    assert npdoc_function.__doc__ == docstring
+
+    new_sig = inspect.Signature(
+        [DescribedParameter(
+            name="whats_this",
+            kind=Parameter.POSITIONAL_OR_KEYWORD,
+            annotation=str,
+            type_description="str",
+            long_description="The string.",
+        )]
+    )
+
+    assert npdoc_function.__name__ == 'npdoc_function'
+
+    if update_signature:
+        assert inspect.signature(npdoc_function) == new_sig
+    else:
+        assert new_sig != inspect.signature(npdoc_function)
+
+
+def test_bind_signature():
+    def func(x, y, *args, **kwargs):
+        args = [x, y, *args]
+        return args, kwargs
+
+    out = func(1, 2, 5, 23, f=10, m=20)
+    assert out[0] == [1, 2, 5, 23] and out[1] == {'f': 10, 'm': 20}
+
+    new_sig = inspect.Signature(
+        [
+            DescribedParameter(name='x', kind=Parameter.POSITIONAL_OR_KEYWORD),
+            DescribedParameter(name='y', kind=Parameter.POSITIONAL_OR_KEYWORD),
+            DescribedParameter(name='z', kind=Parameter.POSITIONAL_OR_KEYWORD),
+            DescribedParameter(name='a', kind=Parameter.KEYWORD_ONLY),
+        ]
+    )
+    wrapped_func = bind_signature_to_function(new_sig, func)
+
+    out = wrapped_func(1, 2, 3, a=10)
+
+    assert out[0] == [1, 2, 3] and out[1] == {'a': 10}
+
+    out = wrapped_func(1, 2, z=3, a=10)
+
+    assert out[0] == [1, 2, 3] and out[1] == {'a': 10}
+
+    out = wrapped_func(1, 2, a=10, z=3)
+
+    assert out[0] == [1, 2, 3] and out[1] == {'a': 10}
+
+    out = wrapped_func(y=2, x=1, a=10, z=3)
+
+    assert out[0] == [1, 2, 3] and out[1] == {'a': 10}
+
+    with pytest.raises(TypeError, match=".*missing a required argument: 'x'"):
+        wrapped_func()
+
+    with pytest.raises(TypeError, match=".*missing a required argument: 'y'"):
+        wrapped_func(1)
+
+    with pytest.raises(TypeError, match=".*missing a required argument: 'z'"):
+        wrapped_func(1, 2)
+
+

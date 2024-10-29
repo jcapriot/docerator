@@ -39,17 +39,17 @@ class DescribedParameter(inspect.Parameter):
         self._long_description = long_description
 
     @property
-    def type_description(self):
+    def type_description(self) -> Optional[str]:
         return self._type_description
 
     @property
-    def long_description(self):
+    def long_description(self) -> Optional[str]:
         return self._long_description
 
     def replace(
             self, *, name=_void, kind=_void, annotation=_void, default=_void,
             type_description=_void, long_description=_void,
-    ):
+    ) -> DescribedParameter:
 
         if name is _void:
             name = self._name
@@ -75,7 +75,7 @@ class DescribedParameter(inspect.Parameter):
             long_description=long_description,
         )
 
-    def __str__(self):
+    def __str__(self) -> str:
         formatted = super().__str__()
         if self._type_description is not None:
             formatted += f" : {self._type_description}"
@@ -83,7 +83,7 @@ class DescribedParameter(inspect.Parameter):
             formatted += f"\n{textwrap.indent(self._long_description, '    ')}"
         return formatted
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         hashed = super().__hash__()
         if self._type_description is not None:
             hashed = hash((hashed, self._type_description))
@@ -91,7 +91,7 @@ class DescribedParameter(inspect.Parameter):
             hashed = hash((hashed, self._long_description))
         return hashed
 
-    def __eq__(self, other):
+    def __eq__(self, other) -> bool:
         if self is other:
             return True
         if not isinstance(other, DescribedParameter):

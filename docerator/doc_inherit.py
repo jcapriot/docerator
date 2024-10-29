@@ -3,6 +3,7 @@ import re
 import importlib
 import functools
 import textwrap
+from turtledemo.penrose import start
 from typing import Callable, Optional
 
 __all__ = ["bind_signature_to_function"]
@@ -77,12 +78,14 @@ def _doc_wrap(
     if not args_to_insert:
         return func
 
+    signature = inspect.signature(func)
+    sig_params = signature.parameters
     super_doc_dict = {}
     # build the super argument dictionary if we will need it.
     if had_super:
         if cls_context is None:
             raise ValueError("cls_context must be set for super lookups")
-        for base in inspect.getmro(cls_context)[:-1]:  # don't bother checking myself or `object`
+        for base in inspect.getmro(cls_context)[:-1][::-1]:  # don't bother checking myself or `object`
             if base_arg_dict := getattr(base, "_arg_dict", None):
                 super_doc_dict.update(base_arg_dict.get(func_name, {}))
 
@@ -146,7 +149,7 @@ def _doc_wrap(
 
     replaced_super_star = False
     for replace_key, args in args_to_insert.items():
-        parameters = []
+        parameters = {}
         for source_name, arg in args:
             if arg[0] != "*":
                 continue
@@ -168,6 +171,19 @@ def _doc_wrap(
                     raise TypeError(f"{target_cls} does not have {func_name} described.")
                 star_arg_dict = star_arg_dict[func_name]
 
+            # first add any parameters that were in my signature
+            # to get the order right:
+
+            for arg_name, param in sig_params.items():
+                if (    arg_name not in func_arg_dict and
+                        arg_name not in star_excludes and
+                        arg_name not in inserted_parameters and
+                        arg_name in star_arg_dict and
+                        arg_name not in parameters
+                ):
+                    param = star_arg_dict[arg_name].replace(kind=param.kind)
+                    parameters[param.name] = param
+
             for arg_name, param in star_arg_dict.items():
                 # for each argument name, check if it was already added.
                 # (or is already in this class's arg_dict for the function.)
@@ -177,23 +193,22 @@ def _doc_wrap(
                         arg_name not in inserted_parameters and
                         arg_name not in parameters
                 ):
-                    parameters.append(param)
+                    parameters[param.name] = param
 
         if parameters:
             # build up the replacement string
-            formatted = "\n".join(parser.format_parameter(par) for par in parameters)
+            formatted = "\n".join(parser.format_parameter(par) for par in parameters.values())
             doc = _replace_doc_args(replace_key, formatted, doc)
 
-            for param in parameters:
+            for param in parameters.values():
                 inserted_parameters[param.name] = param
 
-    signature = inspect.signature(func)
+
     if update_signature:
-        parameters = signature.parameters
         var_kwarg = None
         new_params = []
         # filter out the variational keyword argument
-        for arg, param in parameters.items():
+        for arg, param in sig_params.items():
             if param.kind == inspect.Parameter.VAR_KEYWORD:
                 var_kwarg = param
             elif param.name in star_excludes:
@@ -208,7 +223,7 @@ def _doc_wrap(
 
                 new_params.append(param)
         for param in inserted_parameters.values():
-            if param.name not in parameters and var_kwarg:
+            if param.name not in sig_params and var_kwarg:
                 new_params.append(
                     param.replace(kind=inspect.Parameter.KEYWORD_ONLY)
                 )

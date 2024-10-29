@@ -33,7 +33,6 @@ class Parent(metaclass=docerator.DoceratorMeta):
         whats_this : str
             The string.
         """
-        ...
 
 class ChildClass(Parent):
     """Docstring
@@ -63,7 +62,6 @@ class ChildClass(Parent):
         its_nothing : bool, optional
             Is `whats_this` nothing?
         """
-        return True
 
 class GrandchildClass(
     ChildClass,
@@ -130,4 +128,3 @@ class CousinClass(ChildClass):
         bool
             I'm returning
         """
-        return False

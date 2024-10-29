@@ -21,6 +21,20 @@ class Parent(metaclass=docerator.DoceratorMeta):
 
     def __init__(self, arg1, arg2, arg3, even_more, but_not_too_much): ...
 
+    def a_function(self, x: float, whats_this: str) -> str:
+        """This is a simple function
+
+        With two simple parameters
+
+        Parameters
+        ----------
+        x : float
+            The float
+        whats_this : str
+            The string.
+        """
+        ...
+
 class ChildClass(Parent):
     """Docstring
 
@@ -38,6 +52,18 @@ class ChildClass(Parent):
     """
 
     def __init__(self, arg1, a_new_arg, **kwargs): ...
+
+    def another_func(self, whats_this: str, its_nothing=None) -> bool:
+        """Returns what is this?
+
+        Parameters
+        ----------
+        whats_this : str
+            String to query?
+        its_nothing : bool, optional
+            Is `whats_this` nothing?
+        """
+        return True
 
 class GrandchildClass(
     ChildClass,
@@ -58,3 +84,50 @@ class GrandchildClass(
     ----------------
     %(numpydoc_classes.Parent.*)
     """
+
+class CousinClass(ChildClass):
+    """Kinda related docstring
+
+    I have a bit of a summary here, but I don't want to put my parameter
+    descriptions here just yet, I want to put them in __init__
+    """
+
+    def __init__(self, arg1, a_new_arg, **kwargs):
+        """This is where I am created.
+
+        Parameters
+        ----------
+        %(super.*)
+        """
+
+    def a_function(self, x, whats_this):
+        """Return something
+
+        Parameters
+        ----------
+        %(super.x)
+        %(super.whats_this)
+
+        Returns
+        -------
+        b : str
+             The output
+        """
+
+    def another_func(self, whats_this: str, its_nothing=None, or_isit=False):
+        """
+        This wasn't any good...
+
+        Parameters
+        ----------
+        %(super.whats_this)
+        %(super.its_nothing)
+        or_isit : bool, optional
+            It is actualy something
+
+        Returns
+        -------
+        bool
+            I'm returning
+        """
+        return False

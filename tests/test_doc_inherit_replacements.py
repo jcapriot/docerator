@@ -28,6 +28,7 @@ numpydoc_classes = import_from_path('numpydoc', pathlib.Path(__file__).parent / 
 Parent = numpydoc_classes.Parent
 ChildClass = numpydoc_classes.ChildClass
 GrandchildClass = numpydoc_classes.GrandchildClass
+CousinClass = numpydoc_classes.CousinClass
 
 
 @pytest.mark.parametrize("args", [[], ["single"], ["two", "args"]])
@@ -227,3 +228,158 @@ def test_grandchild_docerator_meta():
     assert GrandchildClass.__doc__ == docstring
     assert GrandchildClass.__init__ is not ChildClass.__init__
     assert inspect.signature(GrandchildClass.__init__) == init_sig
+
+
+def test_cousin_docerator_meta():
+    init_string = """This is where I am created.
+
+        Parameters
+        ----------
+        arg1 : int
+            Not quite the same as parent
+        a_new_arg : dict
+            A dictionary.
+        arg2 : int
+            2 Extended Description.
+        arg3 : int
+            3 Extended Description.
+
+        even_more : list
+        but_not_too_much
+            But another description.
+        """
+
+    if py313:
+        init_string = py313_docstrip(init_string)
+
+    init_sig = inspect.Signature(
+        parameters=[
+            Parameter(name="self", kind=Parameter.POSITIONAL_OR_KEYWORD),
+            DescribedParameter(
+                name="arg1",
+                kind=Parameter.POSITIONAL_OR_KEYWORD,
+                type_description="int",
+                long_description="Not quite the same as parent",
+            ),
+            Parameter(name="a_new_arg", kind=Parameter.POSITIONAL_OR_KEYWORD),
+            DescribedParameter(
+                name="arg2",
+                kind=Parameter.KEYWORD_ONLY,
+                type_description="int",
+                long_description="2 Extended Description.",
+            ),
+            DescribedParameter(
+                name="arg3",
+                kind=Parameter.KEYWORD_ONLY,
+                type_description="int",
+                long_description="3 Extended Description.\n",
+            ),
+            DescribedParameter(
+                name="even_more",
+                kind=Parameter.KEYWORD_ONLY,
+                type_description="list",
+            ),
+            DescribedParameter(
+                name="but_not_too_much",
+                kind=Parameter.KEYWORD_ONLY,
+                long_description="But another description."
+            ),
+        ]
+    )
+
+    assert CousinClass.__init__.__doc__ == init_string
+    assert inspect.signature(CousinClass.__init__) == init_sig
+
+
+def test_cousin_method_replace():
+    func_string = """Return something
+
+        Parameters
+        ----------
+        x : float
+            The float
+        whats_this : str
+            The string.
+
+        Returns
+        -------
+        b : str
+             The output
+        """
+
+    if py313:
+        func_string = py313_docstrip(func_string)
+
+    func_sig = inspect.Signature(
+        parameters=[
+            Parameter(name="self", kind=Parameter.POSITIONAL_OR_KEYWORD),
+            DescribedParameter(
+                name="x",
+                annotation=float,
+                kind=Parameter.POSITIONAL_OR_KEYWORD,
+                type_description="float",
+                long_description="The float",
+            ),
+            DescribedParameter(
+                name="whats_this",
+                kind=Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=str,
+                type_description="str",
+                long_description="The string.",
+            ),
+        ]
+    )
+
+    assert CousinClass.a_function.__doc__ == func_string
+    assert inspect.signature(CousinClass.a_function) == func_sig
+
+
+def test_cousin_another_method_replace():
+    func_string = """
+        This wasn't any good...
+
+        Parameters
+        ----------
+        whats_this : str
+            String to query?
+        its_nothing : bool, optional
+            Is `whats_this` nothing?
+        or_isit : bool, optional
+            It is actualy something
+
+        Returns
+        -------
+        bool
+            I'm returning
+        """
+
+    if py313:
+        func_string = py313_docstrip(func_string)
+
+    func_sig = inspect.Signature(
+        parameters=[
+            Parameter(name="self", kind=Parameter.POSITIONAL_OR_KEYWORD),
+            DescribedParameter(
+                name="whats_this",
+                kind=Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=str,
+                type_description="str",
+                long_description="String to query?",
+            ),
+            DescribedParameter(
+                name="its_nothing",
+                kind=Parameter.POSITIONAL_OR_KEYWORD,
+                default=None,
+                type_description="bool, optional",
+                long_description="Is `whats_this` nothing?",
+            ),
+            Parameter(
+                name="or_isit",
+                kind=Parameter.POSITIONAL_OR_KEYWORD,
+                default=False,
+            ),
+        ]
+    )
+
+    assert CousinClass.another_func.__doc__ == func_string
+    assert inspect.signature(CousinClass.another_func) == func_sig

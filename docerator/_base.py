@@ -1,8 +1,8 @@
 
 import re
 
-REPLACE_REGEX = re.compile(r"%\((?P<replace_key>.*)\)")
-REPLACE_ARG_SPLIT_REGEX = re.compile(r"\s*,\s*")
+REPLACE_REGEX: re.Pattern = re.compile(r"%\((?P<replace_key>.*)\)")
+REPLACE_ARG_SPLIT_REGEX: re.Pattern = re.compile(r"\s*,\s*")
 
 class DocstringInheritWarning(ImportWarning):
     pass
@@ -11,12 +11,12 @@ class DocstringInheritWarning(ImportWarning):
 class DoceratorParsingError(SyntaxError):
     pass
 
-DEBUG_LEVEL = 0
+DEBUG_LEVEL: int = 0
 
-def set_debug_level(level: int) -> bool:
+def set_debug_level(level: int) -> int:
     global DEBUG_LEVEL
     DEBUG_LEVEL = int(level)
     return DEBUG_LEVEL
 
-def get_debug_level():
+def get_debug_level() -> int:
     return DEBUG_LEVEL

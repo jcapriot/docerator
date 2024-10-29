@@ -37,16 +37,16 @@ for section in _numpydoc_sections:
 
 # These numpy regexes require a cleaned docstring
 # first gets the contents of each section (assuming they are in order)
-NUMPY_SECTION_REGEX = re.compile(
+NUMPY_SECTION_REGEX: re.Pattern = re.compile(
     rf"^(?P<summary>[\s\S]+?)??{'?'.join(_section_regexs)}?$"
 )
 # Next parses for "arg : type" items.
-NUMPY_ARG_TYPE_REGEX = re.compile(
+NUMPY_ARG_TYPE_REGEX: re.Pattern = re.compile(
     r"^(?P<arg_name>\S.*?)(?:\s*:\s*(?P<type>.*?))?$", re.MULTILINE
 )
 
 # parse an 'arg' for multiple args
-NUMPY_ARG_SPLIT_REGEX = re.compile(r"\s*,\s*")
+NUMPY_ARG_SPLIT_REGEX: re.Pattern = re.compile(r"\s*,\s*")
 
 
 def _pairwise(iterable):

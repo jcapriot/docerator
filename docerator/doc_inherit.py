@@ -205,7 +205,6 @@ def _doc_wrap(
 
 
     if update_signature:
-        sig_params = signature.parameters
         var_kwarg = None
         new_params = []
         # filter out the variational keyword argument

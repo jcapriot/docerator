@@ -39,6 +39,51 @@ def _replace_doc_args(replace_key: str, replacement: str, doc: str):
     formatted = textwrap.indent(replacement, indent, _skip_first_and_empty())
     return doc.replace(target, formatted)
 
+def _import_target(source_name):
+    # three possibilities here for the target function.
+    # (1) target is a module.Class or
+    # (2) target is module.function or
+    # (3) target is module.Class.function.
+    try:
+        # catch cases 1 and 2
+        module_name, target = source_name.rsplit(".", 1)
+        target = getattr(importlib.import_module(module_name), target)
+    except ValueError:
+        raise ValueError(
+            f"{source_name} does not include the module information. "
+            f"Should be included as module.to.import.from.{source_name}"
+        )
+    except ImportError:
+        # try case 3
+        try:
+            module_name, class_target, func_target = source_name.rsplit(".", 2)
+            target = getattr(importlib.import_module(module_name), class_target)
+            target = getattr(target, func_target)
+        except (ImportError, TypeError):
+            raise ImportError(
+                f"Unable to import class {source_name} for docstring replacement"
+            )
+    return target
+
+
+
+def doc_wrap(
+        doc_style: str=None,
+        star_excludes: set[str]=None,
+        update_signature: bool=True
+) -> Callable:
+    if doc_style is None:
+        doc_style = 'numpydoc'
+    parser = PARSERS[doc_style]
+
+    star_excludes = set(star_excludes) if star_excludes is not None else set()
+    def wrapper(func):
+        if inspect.ismethod(func) or inspect.isfunction(func):
+            return _doc_wrap(func, star_excludes, parser, update_signature=update_signature)
+        else:
+            raise TypeError("func must be a callable function or method.")
+    return wrapper
+
 
 def _doc_wrap(
         func: Callable,
@@ -110,35 +155,18 @@ def _doc_wrap(
                             f"Argument {arg} not found in {cls_context.__name__}'s inheritance tree of {func_name}."
                         )
                 else:
-                    # import the class and get it's arg_dict
-                    try:
-                        module_name, m_class_name = source_name.rsplit(".", 1)
-                    except ValueError:
-                        raise ValueError(
-                            f"{source_name} does not include the module information. "
-                            f"Should be included as module.to.import.from.{source_name}"
-                        )
-                    try:
-                        target_cls = getattr(
-                            importlib.import_module(module_name), m_class_name
-                        )
-                    except ImportError:
-                        raise TypeError(
-                            f"Unable to import class {source_name} for docstring replacement"
-                        ) from None
-                    arg_dict = getattr(target_cls, "_arg_dict", None)
+                    target = _import_target(source_name)
+                    arg_dict = getattr(target, "_arg_dict", None)
                     if arg_dict is None:
-                        raise TypeError(
-                            f"{target_cls} must have an _arg_dict attribute"
-                        )
+                        arg_dict = {func_name:parser.parse_parameters(target)}
                     if func_name not in arg_dict:
                         raise KeyError(
-                            f"{target_cls} does not have an argument dictionary for {func_name}"
+                            f"{target} does not have an argument dictionary for {func_name}"
                         )
                     arg_dict = arg_dict[func_name]
                     if arg not in arg_dict:
                         raise TypeError(
-                            f"{arg}'s description not found in {target_cls}.{func_name}"
+                            f"{arg}'s description not found in {target}"
                         )
                 parameters.append(arg_dict[arg])
         if parameters:
@@ -157,18 +185,12 @@ def _doc_wrap(
                 replaced_super_star = True
                 star_arg_dict = super_doc_dict
             else:
-                module_name, class_name = source_name.rsplit(".", 1)
-                try:
-                    target_cls = getattr(importlib.import_module(module_name), class_name)
-                except ImportError:
-                    raise ImportError(
-                        f"Unable to import class {class_name} for docstring replacement"
-                    )
-                star_arg_dict = getattr(target_cls, "_arg_dict", None)
+                target = _import_target(source_name)
+                star_arg_dict = getattr(target, "_arg_dict", None)
                 if star_arg_dict is None:
-                    raise TypeError(f"{target_cls} must have an _arg_dict.")
+                    star_arg_dict = {func_name:parser.parse_parameters(target)}
                 if func_name not in star_arg_dict:
-                    raise TypeError(f"{target_cls} does not have {func_name} described.")
+                    raise TypeError(f"{target} does not have {func_name} described.")
                 star_arg_dict = star_arg_dict[func_name]
 
             # first add any parameters that were in my signature

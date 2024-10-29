@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = 'docerator'
+description = "Docerator: Making inherited parameter descriptions stronger."
+readme = 'README.rst'
+requires-python = '>=3.9'
+authors = [
+  {name = 'Joseph Capriotti', email = 'josephrcapriotti@gmail.com'},
+]
+keywords = [
+    'documentation', 'innheritance', 'replacement'
+]
+dependencies = [
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX",
+    "Operating System :: Unix",
+    "Operating System :: MacOS",
+    "Natural Language :: English",
+]
+dynamic = ["version"]
+
+[project.license]
+file = 'LICENSE'
+
+[project.urls]
+Homepage = 'https://docerator..xyz'
+Documentation = 'https://docs.simpeg.xyz'
+Repository = 'http://github.com/simpeg/simpeg.git'
+
+[project.optional-dependencies]
+doc = [
+    'numpydoc',
+    'sphinx',
+    'pydata-sphinx-theme',
+]
+test = [
+    "pytest",
+    "coverage",
+]
+
+[tool.setuptools.packages.find]
+include = ["docerator*"]
+
+[tool.setuptools_scm]
+
+[tool.coverage.run]
+branch = true
+source = ["docerator", "tests"]
+
+[tool.coverage.report]
+ignore_errors = false
+show_missing = true
+# Regexes for lines to exclude from consideration
+exclude_also = [
+    # Don't complain about missing debug-only code:
+    "def __repr__",
+    "if self\\.debug",
+
+    # Don't complain if tests don't hit defensive assertion code:
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "AbstractMethodError",
+
+    # Don't complain if non-runnable code isn't run:
+    "if 0:",
+    "if __name__ == .__main__.:",
+
+    # Don't complain about abstract methods, they aren't run:
+    "@(abc\\.)?abstractmethod",
+]

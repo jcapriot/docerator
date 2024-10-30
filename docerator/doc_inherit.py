@@ -8,7 +8,7 @@ from typing import Callable, Optional
 
 __all__ = ["bind_signature_to_function"]
 
-from docerator._base import REPLACE_REGEX
+from docerator._base import REPLACE_REGEX, get_debug_level
 from docerator.parsers import PARSERS, ParameterParser
 
 ARG_SPLIT_REGEX = re.compile(r"\s*,\s*")
@@ -92,6 +92,7 @@ def _doc_wrap(
         cls_context: Optional[type]=None,
         update_signature: bool=True
 ) -> tuple[str, inspect.Signature]:
+    debug_level = get_debug_level()
     doc = func.__doc__
     if inspect.isclass(func):
         func = func.__init__
@@ -99,9 +100,11 @@ def _doc_wrap(
     elif inspect.isfunction(func):
         func_name = func.__name__
     else:
-        raise TypeError(
-            f"must wrap a class or function, got a {type(func)}"
-        )
+        if debug_level:
+            raise TypeError(
+                f"must wrap a class or function, got a {type(func)}"
+            )
+        return func
     if not doc:
         return func
 
@@ -149,26 +152,24 @@ def _doc_wrap(
             # do not process * yet (or *args and **kwargs parameters)
             if arg[0] != "*":
                 if source_name == "super":
-                    arg_dict = super_doc_dict
-                    if arg not in super_doc_dict:
+                    if (param:= super_doc_dict.get(arg, None)) is None and debug_level:
                         raise TypeError(
                             f"Argument {arg} not found in {cls_context.__name__}'s inheritance tree of {func_name}."
                         )
                 else:
                     target = _import_target(source_name)
-                    arg_dict = getattr(target, "_arg_dict", None)
-                    if arg_dict is None:
+                    if (arg_dict:= getattr(target, "_arg_dict", None)) is None:
                         arg_dict = {func_name:parser.parse_parameters(target)}
-                    if func_name not in arg_dict:
+                    if not (arg_dict:= arg_dict.get(func_name, {})):
                         raise KeyError(
                             f"{target} does not have an argument dictionary for {func_name}"
                         )
-                    arg_dict = arg_dict[func_name]
-                    if arg not in arg_dict:
+                    if (param:= arg_dict.get(arg, None)) is None and debug_level:
                         raise TypeError(
                             f"{arg}'s description not found in {target}"
                         )
-                parameters.append(arg_dict[arg])
+                if param is not None:
+                    parameters.append(param)
         if parameters:
             formatted = parser.format_parameter(parameters)
             doc = _replace_doc_args(replace_key, formatted, doc)

@@ -27,7 +27,7 @@ def test_wrong_name_type():
         DescribedParameter(5, Parameter.POSITIONAL_OR_KEYWORD)
 
 def test_wrong_kind_arg():
-    with pytest.raises(ValueError, match="'positional' is not a valid Parameter\.kind"):
+    with pytest.raises(ValueError, match=r"'positional' is not a valid Parameter\.kind"):
         DescribedParameter('arg1', 'positional')
 
 def test_keyword_only_input_error():

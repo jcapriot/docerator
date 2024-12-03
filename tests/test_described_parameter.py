@@ -124,8 +124,16 @@ def test_from_inspect_parameter():
     assert param2.long_description == 'A string!'
 
 
-def test_hashing():
-    param1 = DescribedParameter('arg1', Parameter.POSITIONAL_OR_KEYWORD, type_description='str', long_description='A string!')
+@pytest.mark.parametrize(
+    'args',
+    [
+        {'type_description':'str'},
+        {'long_description':'A string!'},
+        {'type_description':'str', 'long_description':'A string!'},
+    ]
+)
+def test_hash_type(args):
+    param1 = DescribedParameter('arg1', Parameter.POSITIONAL_OR_KEYWORD, **args)
     hash1 = param1.__hash__()
 
     param2 = param1.replace()
@@ -136,3 +144,22 @@ def test_hashing():
     lookup = {param1:'found it!'}
     assert lookup[param2] == 'found it!'
 
+@pytest.mark.parametrize(
+    'args',
+    [
+        {'type_description':'str'},
+        {'long_description':'A string!'},
+        {'type_description':'str', 'long_description':'A string!'},
+    ]
+)
+def test__str__(args):
+    param = Parameter('arg1', Parameter.POSITIONAL_OR_KEYWORD)
+    str_param = str(param)
+    param1 = DescribedParameter.from_inspect_param(param, **args)
+
+    added = ""
+    if 'type_description' in args:
+        added += ' : str'
+    if 'long_description' in args:
+        added += '\n    A string!'
+    assert str(param1) == str_param + added

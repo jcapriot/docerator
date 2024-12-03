@@ -44,7 +44,7 @@ doc = [
 ]
 test = [
     "pytest",
-    "coverage",
+    "coverage[toml]",
 ]
 
 [tool.setuptools.packages.find]

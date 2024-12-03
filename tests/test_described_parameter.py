@@ -31,7 +31,7 @@ def test_wrong_kind_arg():
         DescribedParameter('arg1', 'positional')
 
 def test_keyword_only_input_error():
-    with pytest.raises(TypeError, match=re.escape("DescribedParameter.__init__() takes 3 positional arguments but 4 were given")):
+    with pytest.raises(TypeError, match=".*"+re.escape("__init__() takes 3 positional arguments but 4 were given")):
         DescribedParameter('arg1', Parameter.POSITIONAL_OR_KEYWORD, 2)
 
 def test_default_passthrough():
@@ -94,3 +94,45 @@ def test_replace(arg, value):
             assert getattr(param2, arg) == value
         else:
             assert getattr(param1, attr_name) == getattr(param2, attr_name)
+
+
+def test_equality_self_object():
+    param = DescribedParameter('arg1', Parameter.POSITIONAL_OR_KEYWORD)
+    assert param == param
+
+def test_equality():
+    param1 = DescribedParameter('arg1', Parameter.POSITIONAL_OR_KEYWORD)
+    param2 = DescribedParameter('arg1', Parameter.POSITIONAL_OR_KEYWORD)
+    assert param1 == param2
+
+
+def test_equality_with_parameter():
+    param1 = Parameter('arg1', Parameter.POSITIONAL_OR_KEYWORD)
+    param2 = DescribedParameter('arg1', Parameter.POSITIONAL_OR_KEYWORD, type_description='str')
+    assert param2 == param1
+
+def test_not_equal():
+    param1 = DescribedParameter('arg1', Parameter.POSITIONAL_OR_KEYWORD)
+    assert param1 != 5
+
+
+def test_from_inspect_parameter():
+    param1 = Parameter('arg1', Parameter.POSITIONAL_OR_KEYWORD)
+    param2 = DescribedParameter.from_inspect_param(param1, type_description='str', long_description='A string!')
+    assert param1 == param2
+    assert param2.type_description == 'str'
+    assert param2.long_description == 'A string!'
+
+
+def test_hashing():
+    param1 = DescribedParameter('arg1', Parameter.POSITIONAL_OR_KEYWORD, type_description='str', long_description='A string!')
+    hash1 = param1.__hash__()
+
+    param2 = param1.replace()
+    hash2 = param2.__hash__()
+
+    assert hash1 == hash2
+
+    lookup = {param1:'found it!'}
+    assert lookup[param2] == 'found it!'
+

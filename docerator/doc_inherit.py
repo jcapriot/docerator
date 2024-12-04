@@ -39,6 +39,7 @@ def _replace_doc_args(replace_key: str, replacement: str, doc: str):
     formatted = textwrap.indent(replacement, indent, _skip_first_and_empty())
     return doc.replace(target, formatted)
 
+
 def _import_target(source_name):
     # three possibilities here for the target function.
     # (1) target is a module.Class or
@@ -46,34 +47,78 @@ def _import_target(source_name):
     # (3) target is module.Class.function.
     debug_level = get_debug_level()
     try:
-        # catch cases 1 and 2
+        # will succeed for (1), (2), and (3)
         module_name, target = source_name.rsplit(".", 1)
-        target = getattr(importlib.import_module(module_name), target)
     except ValueError:
-        # usually means the rsplit failed
         if debug_level:
             raise ValueError(
-                f"{source_name} does not include the module information. "
+                f"{source_name} does not include module information. "
                 f"Should be included as module.to.import.from.{source_name}"
             ) from None
-    except AttributeError:
-        # had a valid module_name, but target didn't exist on it.
-        if debug_level:
-            raise AttributeError(
-                f"module {module_name} does not have an attribute named {target}"
-            ) from None
+        return
+    # try to import the parsed module name
+    try:
+        # should succeed for (1) and (2), fail for (3)
+        imported_base = importlib.import_module(module_name)
     except ImportError:
-        # try case 3
+        # try case (3)
         try:
-            module_name, class_target, func_target = source_name.rsplit(".", 2)
-            target = getattr(importlib.import_module(module_name), class_target)
-            target = getattr(target, func_target)
-        except (ImportError, TypeError, AttributeError):
+            # split the module name to see if it was module.submodule.Class.method
+            module_name, class_target = module_name.rsplit(".", 1)
+            imported_base = importlib.import_module(module_name)
+        except (ValueError, ImportError):
+            # case three doesn't parse either
             if debug_level:
                 raise ImportError(
-                    f"Unable to import {source_name} for docstring replacement"
+                    f"Unable to import {module_name} requested for documentation replacement"
                 ) from None
+            return
+        # module import succeeded, check for the class on that module
+        try:
+            imported_base = getattr(imported_base, class_target)
+            module_name = module_name + "." + class_target
+        except AttributeError:
+            if debug_level:
+                raise AttributeError(
+                    f"{module_name} does not have the attribute named {class_target} requested for documentation replacement"
+                ) from None
+            return
+    # have the correct base now, check if it has the target function
+    try:
+        target = getattr(imported_base, target)
+    except AttributeError:
+        # had a valid import base, but the target item didn't exist on it.
+        if debug_level:
+            raise AttributeError(
+                f"{module_name} does not have the attribute named {target} requested for documentation replacement"
+            ) from None
+        return
+
     return target
+    # except ImportError:
+    #     # try case 3
+    #     except ValueError:
+    #         # rsplit failed to find 3 items
+    #         if debug_level:
+    #             raise ValueError(
+    #                 f"{source_name} does not include the module information. "
+    #                 f"Should be included as module.to.import.from.{source_name}"
+    #             ) from None
+    #
+    #         target = getattr(importlib.import_module(module_name), class_target)
+    #     except (ImportError, TypeError):
+    #         if debug_level:
+    #             raise ImportError(
+    #                 f"Unable to import {source_name} for docstring replacement"
+    #             ) from None
+    #     try:
+    #         target = getattr(target, func_target)
+    #     except AttributeError:
+    #         if debug_level:
+    #             raise AttributeError(
+    #                 f"module {module_name} does not have an attribute named {target}"
+    #             ) from None
+    # return target
 
 
 

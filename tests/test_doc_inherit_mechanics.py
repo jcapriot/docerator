@@ -6,37 +6,39 @@ from docerator import set_debug_level
 from docerator.doc_inherit import _import_target
 import docerator
 
-@pytest.fixture()
-def raise_debug_level():
-    set_debug_level(1)
-    yield
+@pytest.fixture(scope="function")
+def debug_level(request):
+    level = request.param
+    set_debug_level(level)
+    yield level
     set_debug_level(0)
 
-def test_bad_import_targets(raise_debug_level):
-    not_a_module_attribute = "bad_mod_attr"
-    msg = re.escape("bad_mod_attr does not include the module information. Should be included as module.to.import.from.bad_mod_attr")
-    with pytest.raises(ValueError, match=msg):
-        _import_target(not_a_module_attribute)
-
-def test_bad_import_attribute(raise_debug_level):
-    not_importable_target = "inspect.bam"
-    msg = re.escape("module inspect does not have an attribute named bam")
-    with pytest.raises(AttributeError, match=msg):
-        _import_target(not_importable_target)
-
-def test_bad_class_member_import(raise_debug_level):
-    not_importable_target = "docerator.NotClass.anything"
-    msg = re.escape("Unable to import docerator.NotClass.anything for docstring replacement")
-    with pytest.raises(ImportError, match=msg):
-        _import_target(not_importable_target)
-
-
-def test_class_bad_member_import(raise_debug_level):
-    target = "docerator.DoceratorMeta.not_a_thing"
-    msg = re.escape('Unable to import docerator.DoceratorMeta.not_a_thing for docstring replacement')
-    with pytest.raises(ImportError, match=msg):
+@pytest.mark.parametrize(
+    ['target', 'error_class', 'match'],
+    [
+        ["bad_mod_attr", ValueError, re.escape("bad_mod_attr does not include module information. Should be included as module.to.import.from.bad_mod_attr")],
+        ["not_a_module.function", ImportError, re.escape("Unable to import not_a_module requested for documentation replacement")],
+        ["inspect.bam", AttributeError, re.escape("inspect does not have the attribute named bam requested for documentation replacement")],
+        ["not_a_module.Class.function", ImportError, re.escape("Unable to import not_a_module requested for documentation replacement")],
+        ["docerator.NotClass.anything", AttributeError, re.escape("docerator does not have the attribute named NotClass requested for documentation replacement")],
+        ["docerator.DoceratorMeta.not_a_thing", AttributeError, re.escape('docerator.DoceratorMeta does not have the attribute named not_a_thing requested for documentation replacement')],
+    ]
+)
+@pytest.mark.parametrize('debug_level', [0, 1], indirect=True)
+def test_import_errors(target, error_class, match, debug_level):
+    if debug_level:
+        with pytest.raises(error_class, match=match):
+            _import_target(target)
+    else:
         _import_target(target)
 
-
-def test_bad_import():
-    pass
+@pytest.mark.parametrize(
+    ['target', 'valid_target'], [
+        ["docerator.DescribedParameter", docerator.DescribedParameter],
+        ["docerator.DescribedParameter.type_description",docerator.DescribedParameter.type_description],
+        ["docerator.bind_signature_to_function", docerator.bind_signature_to_function],
+    ]
+)
+def test_good_import(target, valid_target):
+    imported = _import_target(target)
+    assert imported is valid_target

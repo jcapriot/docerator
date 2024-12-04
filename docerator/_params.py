@@ -1,13 +1,21 @@
 from __future__ import annotations  # used for lookahead returns
 import inspect
 import textwrap
-from typing import Optional
+from typing import Optional, Literal
+
+ParameterKinds = Literal[
+    inspect.Parameter.POSITIONAL_ONLY,
+    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    inspect.Parameter.VAR_POSITIONAL,
+    inspect.Parameter.KEYWORD_ONLY,
+    inspect.Parameter.VAR_KEYWORD,
+]
 
 class _void():
     """An empty class to mark no input."""
     pass
 # note that there are custom types to describe empty defaults and annotations
-# because None is a perfectly valid thing to be there.
+# because None is a perfectly valid thing to be a default value.
 
 class DescribedParameter(inspect.Parameter):
 
@@ -16,7 +24,7 @@ class DescribedParameter(inspect.Parameter):
     def __init__(
             self,
             name: str,
-            kind: str,
+            kind: ParameterKinds,
             *,
             default: object=inspect.Parameter.empty,
             annotation=inspect.Parameter.empty,
@@ -26,14 +34,14 @@ class DescribedParameter(inspect.Parameter):
     ) -> None:
         super().__init__(name, kind, default=default, annotation=annotation)
         if type_description is not None and not isinstance(type_description, str):
-            TypeError(
+            raise TypeError(
                 f"type_description must be a str, not a {type(type_description).__name__}"
             )
         self._type_description = type_description
         if long_description is not None:
             if not isinstance(long_description, str):
-                TypeError(
-                    f"type_description must be a str, not a {type(type_description).__name__}"
+                raise TypeError(
+                    f"long_description must be a str, not a {type(long_description).__name__}"
                 )
             long_description = textwrap.dedent(long_description)
         self._long_description = long_description

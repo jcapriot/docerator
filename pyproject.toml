@@ -44,7 +44,7 @@ doc = [
 ]
 test = [
     "pytest",
-    "coverage",
+    "coverage[toml]",
 ]
 
 [tool.setuptools.packages.find]
@@ -76,4 +76,12 @@ exclude_also = [
 
     # Don't complain about abstract methods, they aren't run:
     "@(abc\\.)?abstractmethod",
+
+    # Don't complain about non-implemented methods (methods that just have an ellipses)
+    ".*\\.\\.\\.",
+]
+
+[tool.pytest.ini_options]
+norecursedirs = [
+    "tests/helpers",
 ]

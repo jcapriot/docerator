@@ -8,7 +8,7 @@ from typing import Callable, Optional
 
 __all__ = ["bind_signature_to_function"]
 
-from docerator._base import REPLACE_REGEX
+from docerator._base import REPLACE_REGEX, get_debug_level
 from docerator.parsers import PARSERS, ParameterParser
 
 ARG_SPLIT_REGEX = re.compile(r"\s*,\s*")
@@ -39,32 +39,62 @@ def _replace_doc_args(replace_key: str, replacement: str, doc: str):
     formatted = textwrap.indent(replacement, indent, _skip_first_and_empty())
     return doc.replace(target, formatted)
 
+
 def _import_target(source_name):
     # three possibilities here for the target function.
     # (1) target is a module.Class or
     # (2) target is module.function or
     # (3) target is module.Class.function.
+    debug_level = get_debug_level()
     try:
-        # catch cases 1 and 2
+        # will succeed for (1), (2), and (3)
         module_name, target = source_name.rsplit(".", 1)
-        target = getattr(importlib.import_module(module_name), target)
     except ValueError:
-        raise ValueError(
-            f"{source_name} does not include the module information. "
-            f"Should be included as module.to.import.from.{source_name}"
-        )
+        if debug_level:
+            raise ValueError(
+                f"{source_name} does not include module information. "
+                f"Should be included as module.to.import.from.{source_name}"
+            ) from None
+        return
+    # try to import the parsed module name
+    try:
+        # should succeed for (1) and (2), fail for (3)
+        imported_base = importlib.import_module(module_name)
     except ImportError:
-        # try case 3
+        # try case (3)
         try:
-            module_name, class_target, func_target = source_name.rsplit(".", 2)
-            target = getattr(importlib.import_module(module_name), class_target)
-            target = getattr(target, func_target)
-        except (ImportError, TypeError):
-            raise ImportError(
-                f"Unable to import class {source_name} for docstring replacement"
-            )
-    return target
+            # split the module name to see if it was module.submodule.Class.method
+            module_name, class_target = module_name.rsplit(".", 1)
+            imported_base = importlib.import_module(module_name)
+        except (ValueError, ImportError):
+            # case three doesn't parse either
+            if debug_level:
+                raise ImportError(
+                    f"Unable to import {module_name} requested for documentation replacement"
+                ) from None
+            return
+        # module import succeeded, check for the class on that module
+        try:
+            imported_base = getattr(imported_base, class_target)
+            module_name = module_name + "." + class_target
+        except AttributeError:
+            if debug_level:
+                raise AttributeError(
+                    f"{module_name} does not have the attribute named {class_target} requested for documentation replacement"
+                ) from None
+            return
+    # have the correct base now, check if it has the target function
+    try:
+        target = getattr(imported_base, target)
+    except AttributeError:
+        # had a valid import base, but the target item didn't exist on it.
+        if debug_level:
+            raise AttributeError(
+                f"{module_name} does not have the attribute named {target} requested for documentation replacement"
+            ) from None
+        return
 
+    return target
 
 
 def doc_wrap(
@@ -92,6 +122,7 @@ def _doc_wrap(
         cls_context: Optional[type]=None,
         update_signature: bool=True
 ) -> tuple[str, inspect.Signature]:
+    debug_level = get_debug_level()
     doc = func.__doc__
     if inspect.isclass(func):
         func = func.__init__
@@ -99,9 +130,11 @@ def _doc_wrap(
     elif inspect.isfunction(func):
         func_name = func.__name__
     else:
-        raise TypeError(
-            f"must wrap a class or function, got a {type(func)}"
-        )
+        if debug_level:
+            raise TypeError(
+                f"must wrap a class or function, got a {type(func)}"
+            )
+        return func
     if not doc:
         return func
 
@@ -149,26 +182,24 @@ def _doc_wrap(
             # do not process * yet (or *args and **kwargs parameters)
             if arg[0] != "*":
                 if source_name == "super":
-                    arg_dict = super_doc_dict
-                    if arg not in super_doc_dict:
+                    if (param:= super_doc_dict.get(arg, None)) is None and debug_level:
                         raise TypeError(
                             f"Argument {arg} not found in {cls_context.__name__}'s inheritance tree of {func_name}."
                         )
                 else:
                     target = _import_target(source_name)
-                    arg_dict = getattr(target, "_arg_dict", None)
-                    if arg_dict is None:
+                    if (arg_dict:= getattr(target, "_arg_dict", None)) is None:
                         arg_dict = {func_name:parser.parse_parameters(target)}
-                    if func_name not in arg_dict:
+                    if not (arg_dict:= arg_dict.get(func_name, {})):
                         raise KeyError(
                             f"{target} does not have an argument dictionary for {func_name}"
                         )
-                    arg_dict = arg_dict[func_name]
-                    if arg not in arg_dict:
+                    if (param:= arg_dict.get(arg, None)) is None and debug_level:
                         raise TypeError(
                             f"{arg}'s description not found in {target}"
                         )
-                parameters.append(arg_dict[arg])
+                if param is not None:
+                    parameters.append(param)
         if parameters:
             formatted = parser.format_parameter(parameters)
             doc = _replace_doc_args(replace_key, formatted, doc)

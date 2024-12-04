@@ -44,25 +44,35 @@ def _import_target(source_name):
     # (1) target is a module.Class or
     # (2) target is module.function or
     # (3) target is module.Class.function.
+    debug_level = get_debug_level()
     try:
         # catch cases 1 and 2
         module_name, target = source_name.rsplit(".", 1)
         target = getattr(importlib.import_module(module_name), target)
     except ValueError:
-        raise ValueError(
-            f"{source_name} does not include the module information. "
-            f"Should be included as module.to.import.from.{source_name}"
-        )
+        # usually means the rsplit failed
+        if debug_level:
+            raise ValueError(
+                f"{source_name} does not include the module information. "
+                f"Should be included as module.to.import.from.{source_name}"
+            ) from None
+    except AttributeError:
+        # had a valid module_name, but target didn't exist on it.
+        if debug_level:
+            raise AttributeError(
+                f"module {module_name} does not have an attribute named {target}"
+            ) from None
     except ImportError:
         # try case 3
         try:
             module_name, class_target, func_target = source_name.rsplit(".", 2)
             target = getattr(importlib.import_module(module_name), class_target)
             target = getattr(target, func_target)
-        except (ImportError, TypeError):
-            raise ImportError(
-                f"Unable to import class {source_name} for docstring replacement"
-            )
+        except (ImportError, TypeError, AttributeError):
+            if debug_level:
+                raise ImportError(
+                    f"Unable to import {source_name} for docstring replacement"
+                ) from None
     return target
 
 

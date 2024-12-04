@@ -95,31 +95,6 @@ def _import_target(source_name):
         return
 
     return target
-    # except ImportError:
-    #     # try case 3
-    #     except ValueError:
-    #         # rsplit failed to find 3 items
-    #         if debug_level:
-    #             raise ValueError(
-    #                 f"{source_name} does not include the module information. "
-    #                 f"Should be included as module.to.import.from.{source_name}"
-    #             ) from None
-    #
-    #         target = getattr(importlib.import_module(module_name), class_target)
-    #     except (ImportError, TypeError):
-    #         if debug_level:
-    #             raise ImportError(
-    #                 f"Unable to import {source_name} for docstring replacement"
-    #             ) from None
-    #     try:
-    #         target = getattr(target, func_target)
-    #     except AttributeError:
-    #         if debug_level:
-    #             raise AttributeError(
-    #                 f"module {module_name} does not have an attribute named {target}"
-    #             ) from None
-    # return target
-
 
 
 def doc_wrap(

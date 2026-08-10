@@ -3,20 +3,30 @@
 //! decorators to the statement it decorates; a blank line or a comment that isn't a `docerator:`
 //! directive breaks the chain. Grammar is deliberately one directive per comment line (not
 //! comma-joined onto one line) — `override=arg1,arg2` already uses commas for its own value
-//! list, so stacking `# docerator: skip` / `# docerator: expand=kwargs` as separate lines avoids
-//! ambiguity about which commas separate directives versus which separate one directive's values.
+//! list, so stacking `# docerator: skip` / `# docerator: expand_kwargs=parameters` as separate
+//! lines avoids ambiguity about which commas separate directives versus which separate one
+//! directive's values.
 
 use std::collections::HashSet;
 
 use ruff_text_size::{TextRange, TextSize};
 
-use crate::style::{Diagnostic, Severity};
+use crate::style::{Diagnostic, ParamSectionKind, Severity};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Directives {
     pub skip: bool,
     pub style: Option<String>,
     pub overrides: HashSet<String>,
+    /// `expand_kwargs` (bare, defaults to `others`) / `expand_kwargs=parameters` /
+    /// `expand_kwargs=others` — pull ancestor-documented parameters not literally named in the
+    /// local signature into an auto-managed block in the chosen section. Only meaningful when
+    /// the entity's signature actually has `**kwargs`; `sync.rs` diagnoses the mismatch
+    /// otherwise.
+    pub expand_kwargs_into: Option<ParamSectionKind>,
+    /// `exclude=arg1,arg2` — names to leave out of an `expand_kwargs` pull. Meaningless without
+    /// `expand_kwargs` (named signature parameters are never optional to document).
+    pub exclude: HashSet<String>,
 }
 
 impl Directives {
@@ -51,6 +61,37 @@ impl Directives {
                     code: "DOC006",
                     severity: Severity::Warning,
                     message: "'override' requires a value, e.g. override=arg1,arg2".to_string(),
+                    range,
+                }),
+            },
+            "expand_kwargs" => {
+                self.expand_kwargs_into = Some(match value {
+                    None => ParamSectionKind::Secondary,
+                    Some("parameters") => ParamSectionKind::Primary,
+                    Some("others" | "other_parameters") => ParamSectionKind::Secondary,
+                    Some(other) => {
+                        diagnostics.push(Diagnostic {
+                            code: "DOC006",
+                            severity: Severity::Warning,
+                            message: format!(
+                                "'expand_kwargs' value '{other}' not recognized (expected 'parameters' or \
+                                 'others', or no value at all) — defaulting to 'others'"
+                            ),
+                            range,
+                        });
+                        ParamSectionKind::Secondary
+                    }
+                });
+            }
+            "exclude" => match value {
+                Some(v) if !v.is_empty() => {
+                    self.exclude
+                        .extend(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string));
+                }
+                _ => diagnostics.push(Diagnostic {
+                    code: "DOC006",
+                    severity: Severity::Warning,
+                    message: "'exclude' requires a value, e.g. exclude=arg1,arg2".to_string(),
                     range,
                 }),
             },

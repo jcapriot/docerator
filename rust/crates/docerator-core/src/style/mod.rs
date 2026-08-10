@@ -15,12 +15,36 @@ pub struct ParamEntry {
     pub range: TextRange,
 }
 
-/// The result of parsing one docstring's parameter-documenting section(s), normalized to a
-/// style-agnostic name -> entry map. Insertion order is preserved (matches source order),
-/// mirroring the ordering guarantees Python dicts already gave the original implementation.
+/// The result of parsing one docstring's parameter-documenting section(s), normalized to two
+/// style-agnostic name -> entry maps — `primary` (numpydoc's `Parameters`) and `secondary`
+/// (numpydoc's `Other Parameters`) — kept separate because the auto-sync engine needs to know
+/// which section an entry belongs to (or should be inserted into): named signature parameters
+/// are managed in `primary`, `expand=kwargs`-pulled parameters are managed in `secondary`.
+/// Insertion order within each map is preserved (matches source order).
 #[derive(Debug, Clone, Default)]
 pub struct ParsedEntries {
-    pub entries: IndexMap<String, ParamEntry>,
+    pub primary: IndexMap<String, ParamEntry>,
+    pub secondary: IndexMap<String, ParamEntry>,
+}
+
+impl ParsedEntries {
+    /// Look up a name regardless of which section it's documented in.
+    pub fn get(&self, name: &str) -> Option<&ParamEntry> {
+        self.primary.get(name).or_else(|| self.secondary.get(name))
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// Every entry from both sections, primary first, each in its own source order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &ParamEntry)> {
+        self.primary.iter().chain(self.secondary.iter())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.primary.is_empty() && self.secondary.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

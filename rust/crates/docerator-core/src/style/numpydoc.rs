@@ -64,8 +64,12 @@ impl DocStyle for NumpydocStyle {
         out
     }
 
-    fn synthesize_section(&self, _section: ParamSectionKind) -> String {
-        unimplemented!("wired up when M3+ needs to create a Parameters section from scratch")
+    fn synthesize_section(&self, section: ParamSectionKind) -> String {
+        let name = match section {
+            ParamSectionKind::Primary => "Parameters",
+            ParamSectionKind::Secondary => "Other Parameters",
+        };
+        format!("{name}\n{}\n", "-".repeat(name.chars().count()))
     }
 }
 
@@ -262,22 +266,12 @@ fn split_name_type(content: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn parse_entries(source: &str) -> (ParsedEntries, Vec<Diagnostic>) {
-    let mut diagnostics = Vec::new();
-    let lines = split_lines(source);
-    let margin = compute_margin(&lines, source);
-    let sections = find_sections(&lines, source, margin, &mut diagnostics);
-
-    let params_section = sections.iter().find(|s| s.canon_index == PARAMETERS_INDEX);
-    let others_section = sections.iter().find(|s| s.canon_index == OTHER_PARAMETERS_INDEX);
-
+/// Parse one section's own body in isolation — every boundary (the "next arg line", the
+/// fallback end-of-description) stays within this section's own `body_end`, so `Parameters`
+/// and `Other Parameters` can always be parsed independently with no cross-section bleed.
+fn parse_section(lines: &[Line], source: &str, section: &SectionBody, margin: usize) -> IndexMap<String, ParamEntry> {
     let mut arg_line_indices: Vec<usize> = Vec::new();
-    if let Some(s) = params_section {
-        collect_arg_lines(&lines, source, s.body_start, s.body_end, margin, &mut arg_line_indices);
-    }
-    if let Some(s) = others_section {
-        collect_arg_lines(&lines, source, s.body_start, s.body_end, margin, &mut arg_line_indices);
-    }
+    collect_arg_lines(lines, source, section.body_start, section.body_end, margin, &mut arg_line_indices);
 
     let mut entries = IndexMap::new();
     for (pos, &line_idx) in arg_line_indices.iter().enumerate() {
@@ -290,30 +284,28 @@ fn parse_entries(source: &str) -> (ParsedEntries, Vec<Diagnostic>) {
         }
         let (raw_names, type_desc) = split_name_type(content);
 
-        let section_end = if let Some(s) = params_section {
-            if line.start < s.body_end {
-                s.body_end
-            } else {
-                others_section.map(|o| o.body_end).unwrap_or(s.body_end)
-            }
-        } else {
-            others_section.map(|o| o.body_end).unwrap_or(line.end)
-        };
-
         let desc_start = line.end + 1;
-        let desc_end = match arg_line_indices.get(pos + 1) {
-            Some(&next_idx) => lines[next_idx].start.saturating_sub(1).min(section_end),
-            None => section_end,
+        let raw_desc_end = match arg_line_indices.get(pos + 1) {
+            Some(&next_idx) => lines[next_idx].start.saturating_sub(1).min(section.body_end),
+            None => section.body_end,
         };
-        let description = if desc_start < desc_end {
-            let text = &source[desc_start..desc_end];
-            if text.is_empty() {
-                None
+        // Trim trailing whitespace: an entry that's the last one in its section, immediately
+        // followed by another section, otherwise picks up one incidental trailing newline from
+        // the blank-line gap before that next section's header (the same slicing rule that
+        // correctly excludes the header itself leaves this one artifact behind). That's not
+        // real content — left untrimmed it makes two structurally-identical entries compare
+        // unequal across classes, and if an edit *is* needed, splicing over it eats the
+        // blank-line separator along with it. Interior blank lines (a genuine multi-paragraph
+        // description) are untouched since trimming only ever shortens from the end.
+        let (description, desc_end) = if desc_start < raw_desc_end {
+            let trimmed = source[desc_start..raw_desc_end].trim_end();
+            if trimmed.is_empty() {
+                (None, line.end)
             } else {
-                Some(text.to_string())
+                (Some(trimmed.to_string()), desc_start + trimmed.len())
             }
         } else {
-            None
+            (None, line.end)
         };
 
         // Range starts *after* the line's leading margin indentation, not at the line start —
@@ -336,14 +328,27 @@ fn parse_entries(source: &str) -> (ParsedEntries, Vec<Diagnostic>) {
             );
         }
     }
+    entries
+}
+
+fn parse_entries(source: &str) -> (ParsedEntries, Vec<Diagnostic>) {
+    let mut diagnostics = Vec::new();
+    let lines = split_lines(source);
+    let margin = compute_margin(&lines, source);
+    let sections = find_sections(&lines, source, margin, &mut diagnostics);
+
+    let params_section = sections.iter().find(|s| s.canon_index == PARAMETERS_INDEX);
+    let others_section = sections.iter().find(|s| s.canon_index == OTHER_PARAMETERS_INDEX);
+
+    let primary = params_section
+        .map(|s| parse_section(&lines, source, s, margin))
+        .unwrap_or_default();
+    let secondary = others_section
+        .map(|s| parse_section(&lines, source, s, margin))
+        .unwrap_or_default();
 
     if let Some(s) = params_section {
-        let params_only_lines: Vec<usize> = arg_line_indices
-            .iter()
-            .copied()
-            .filter(|&idx| lines[idx].start >= s.body_start && lines[idx].end <= s.body_end)
-            .collect();
-        if params_only_lines.is_empty() {
+        if primary.is_empty() {
             diagnostics.push(Diagnostic {
                 code: "DOC005",
                 severity: Severity::Warning,
@@ -358,7 +363,7 @@ fn parse_entries(source: &str) -> (ParsedEntries, Vec<Diagnostic>) {
         }
     }
 
-    (ParsedEntries { entries }, diagnostics)
+    (ParsedEntries { primary, secondary }, diagnostics)
 }
 
 #[cfg(test)]
@@ -367,7 +372,7 @@ mod tests {
     use rstest::rstest;
 
     fn entry_names(parsed: &ParsedEntries) -> Vec<&str> {
-        parsed.entries.keys().map(String::as_str).collect()
+        parsed.iter().map(|(name, _)| name.as_str()).collect()
     }
 
     #[rstest]
@@ -404,7 +409,7 @@ mod tests {
             ]
         );
 
-        let get = |n: &str| parsed.entries.get(n).unwrap();
+        let get = |n: &str| parsed.get(n).unwrap();
         assert_eq!(get("item_no_type").type_description, None);
         assert_eq!(get("item1").type_description.as_deref(), Some("type"));
         assert_eq!(get("item2_no_space").type_description.as_deref(), Some("object, optional"));
@@ -418,12 +423,12 @@ mod tests {
         );
         assert_eq!(
             get("item7").description.as_deref(),
-            Some("    I've got a description line\n    that ends with an empty line.\n")
+            Some("    I've got a description line\n    that ends with an empty line.")
         );
         assert_eq!(get("multiple").type_description.as_deref(), Some("shared type"));
-        assert_eq!(get("multiple").description.as_deref(), Some("    Shared Description\n"));
+        assert_eq!(get("multiple").description.as_deref(), Some("    Shared Description"));
         assert_eq!(get("args").type_description.as_deref(), Some("shared type"));
-        assert_eq!(get("args").description.as_deref(), Some("    Shared Description\n"));
+        assert_eq!(get("args").description.as_deref(), Some("    Shared Description"));
     }
 
     #[test]
@@ -445,7 +450,7 @@ mod tests {
     fn section_out_of_canonical_order_is_rejected_with_diagnostic() {
         let doc = "Summary\n\nAttributes\n----------\nitem1\n\nParameters\n----------\nitem2\n\nReturns\n-------\n";
         let (parsed, diagnostics) = parse_entries(doc);
-        assert!(parsed.entries.is_empty());
+        assert!(parsed.is_empty());
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, "DOC003");
     }
@@ -457,7 +462,7 @@ mod tests {
         let dashes = "-".repeat(dash_length);
         let doc = format!("Summary\n\nParameters\n{dashes}\nitem\n");
         let (parsed, diagnostics) = parse_entries(&doc);
-        assert!(parsed.entries.is_empty());
+        assert!(parsed.is_empty());
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, "DOC004");
     }
@@ -466,7 +471,7 @@ mod tests {
     fn misindented_section_header_is_not_recognized() {
         let doc = "Summary\n Parameters\n----------\nitem2\n\nReturns\n-------\n";
         let (parsed, diagnostics) = parse_entries(doc);
-        assert!(parsed.entries.is_empty());
+        assert!(parsed.is_empty());
         assert!(diagnostics.is_empty());
     }
 
@@ -474,7 +479,7 @@ mod tests {
     fn misindented_arg_line_yields_no_entries_and_a_diagnostic() {
         let doc = "Summary\n\nParameters\n----------\n bad_indent\n";
         let (parsed, diagnostics) = parse_entries(doc);
-        assert!(parsed.entries.is_empty());
+        assert!(parsed.is_empty());
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, "DOC005");
     }
@@ -483,7 +488,7 @@ mod tests {
     fn section_with_no_parameters_section_present_is_empty() {
         let doc = "Summary\nInformation about this class\n\nReturns\n-------\nnothing : None\n    This doesn't return anything, but this description looks like an arg type.\n";
         let (parsed, diagnostics) = parse_entries(doc);
-        assert!(parsed.entries.is_empty());
+        assert!(parsed.is_empty());
         assert!(diagnostics.is_empty());
     }
 

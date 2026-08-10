@@ -1,3 +1,4 @@
+pub mod directives;
 pub mod docstring;
 pub mod edit;
 pub mod model;

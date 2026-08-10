@@ -7,6 +7,9 @@ use indexmap::IndexMap;
 use ruff_python_ast::{Expr, ModModule, Stmt, StmtClassDef, StmtFunctionDef};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
+use crate::directives::{self, Directives};
+use crate::style::Diagnostic;
+
 #[derive(Debug, Clone)]
 pub struct DocstringInfo {
     /// Absolute (file-coordinate) byte range of the docstring's interior text, quotes excluded.
@@ -27,41 +30,60 @@ pub struct ParamSignature {
 pub struct MethodModel {
     pub docstring: Option<DocstringInfo>,
     pub signature: ParamSignature,
+    /// Directives from a `# docerator:` comment directly above this method (through its own
+    /// decorators, if any) — does NOT include the enclosing class's directives; merging class-
+    /// and method-level directives is `sync.rs`'s job, since only it knows which directives are
+    /// class-broadcast (`skip`) versus `__init__`-only (`override`, `style`).
+    pub directives: Directives,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ClassModel {
     pub base_names: Vec<String>,
     pub methods: IndexMap<String, MethodModel>,
+    /// Directives from a `# docerator:` comment directly above the class itself.
+    pub directives: Directives,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct FileModel {
     pub classes: IndexMap<String, ClassModel>,
+    /// The project-wide-style-equivalent default declared at file scope: the last
+    /// `# docerator: style=...` comment appearing before the first top-level class/function.
+    pub file_level_style: Option<String>,
 }
 
-pub fn build_file_model(source: &str, module: &ModModule) -> FileModel {
+pub fn build_file_model(source: &str, module: &ModModule, diagnostics: &mut Vec<Diagnostic>) -> FileModel {
     let mut classes = IndexMap::new();
-    collect_classes(source, &module.body, &mut classes);
-    FileModel { classes }
+    collect_classes(source, &module.body, &mut classes, diagnostics);
+
+    let first_top_level_def_start = module.body.iter().find_map(|stmt| match stmt {
+        Stmt::ClassDef(c) => Some(c.range().start()),
+        Stmt::FunctionDef(f) => Some(f.range().start()),
+        _ => None,
+    });
+    let file_level_style =
+        first_top_level_def_start.and_then(|offset| directives::file_level_style(source, offset));
+
+    FileModel { classes, file_level_style }
 }
 
-fn collect_classes(source: &str, body: &[Stmt], out: &mut IndexMap<String, ClassModel>) {
+fn collect_classes(source: &str, body: &[Stmt], out: &mut IndexMap<String, ClassModel>, diagnostics: &mut Vec<Diagnostic>) {
     for stmt in body {
         match stmt {
             Stmt::ClassDef(class_def) => {
-                out.insert(class_def.name.to_string(), build_class_model(source, class_def));
-                collect_classes(source, &class_def.body, out);
+                out.insert(class_def.name.to_string(), build_class_model(source, class_def, diagnostics));
+                collect_classes(source, &class_def.body, out, diagnostics);
             }
             Stmt::FunctionDef(func_def) => {
-                collect_classes(source, &func_def.body, out);
+                collect_classes(source, &func_def.body, out, diagnostics);
             }
             _ => {}
         }
     }
 }
 
-fn build_class_model(source: &str, class_def: &StmtClassDef) -> ClassModel {
+fn build_class_model(source: &str, class_def: &StmtClassDef, diagnostics: &mut Vec<Diagnostic>) -> ClassModel {
     let base_names = class_def
         .arguments
         .as_ref()
@@ -69,6 +91,12 @@ fn build_class_model(source: &str, class_def: &StmtClassDef) -> ClassModel {
         .unwrap_or_default();
 
     let class_docstring = leading_docstring(source, &class_def.body);
+    let class_anchor = class_def
+        .decorator_list
+        .first()
+        .map(|d| d.range().start())
+        .unwrap_or_else(|| class_def.range().start());
+    let class_directives = directives::resolve_directives_for(source, class_anchor, diagnostics);
 
     let mut methods = IndexMap::new();
     for stmt in &class_def.body {
@@ -80,11 +108,28 @@ fn build_class_model(source: &str, class_def: &StmtClassDef) -> ClassModel {
                 own_doc
             };
             let signature = extract_signature(func_def);
-            methods.insert(func_def.name.to_string(), MethodModel { docstring, signature });
+            let method_anchor = func_def
+                .decorator_list
+                .first()
+                .map(|d| d.range().start())
+                .unwrap_or_else(|| func_def.range().start());
+            let method_directives = directives::resolve_directives_for(source, method_anchor, diagnostics);
+            methods.insert(
+                func_def.name.to_string(),
+                MethodModel {
+                    docstring,
+                    signature,
+                    directives: method_directives,
+                },
+            );
         }
     }
 
-    ClassModel { base_names, methods }
+    ClassModel {
+        base_names,
+        methods,
+        directives: class_directives,
+    }
 }
 
 fn simple_name(expr: &Expr) -> Option<String> {

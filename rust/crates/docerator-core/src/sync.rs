@@ -178,6 +178,27 @@ fn resolve_and_rewrite(
                         });
                     }
 
+                    for name in &effective_overrides {
+                        if !method.signature.names.contains(name) {
+                            diagnostics.push(Diagnostic {
+                                code: "DOC007",
+                                severity: Severity::Warning,
+                                message: format!(
+                                    "'override' names '{name}', which is not a parameter in this entity's signature"
+                                ),
+                                range: doc.inner_range,
+                            });
+                        }
+                    }
+                    if !effective_exclude.is_empty() && effective_expand_target.is_none() {
+                        diagnostics.push(Diagnostic {
+                            code: "DOC007",
+                            severity: Severity::Warning,
+                            message: "'exclude' has no effect without 'expand_kwargs'".to_string(),
+                            range: doc.inner_range,
+                        });
+                    }
+
                     for name in &method.signature.names {
                         if effective_overrides.contains(name) {
                             continue;
@@ -1261,5 +1282,48 @@ class Child(Exception):
         let out = &outputs["usage.py"];
         assert_eq!(out.text, source);
         assert!(out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", out.diagnostics);
+    }
+
+    #[test]
+    fn override_naming_a_non_signature_parameter_is_diagnosed() {
+        let source = "\
+# docerator: override=not_a_real_param
+class Solo:
+    \"\"\"Solo.
+
+    Parameters
+    ----------
+    arg1 : int
+        Documented.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let (_output, diagnostics) = sync(source);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "DOC007");
+        assert!(diagnostics[0].message.contains("not_a_real_param"));
+    }
+
+    #[test]
+    fn exclude_without_expand_kwargs_is_diagnosed() {
+        let source = "\
+# docerator: exclude=arg2
+class Solo:
+    \"\"\"Solo.
+
+    Parameters
+    ----------
+    arg1 : int
+        Documented.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let (_output, diagnostics) = sync(source);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "DOC007");
     }
 }

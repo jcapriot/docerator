@@ -1,6 +1,7 @@
 pub mod directives;
 pub mod docstring;
 pub mod edit;
+pub mod location;
 pub mod model;
 pub mod parse;
 pub mod project;

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use indexmap::IndexMap;
 use ruff_text_size::{TextRange, TextSize};
 
+use crate::cache::{self, Cache};
 use crate::edit::{apply_edits, TextEdit};
 use crate::model::{self, ClassModel, MethodModel};
 use crate::parse;
@@ -30,12 +31,61 @@ pub struct FileOutput {
 /// `files` should already be `.py` files only — filtering out anything else (and walking a real
 /// directory tree in the first place) is the CLI's job, not this library's.
 pub fn sync_project(files: &[(PathBuf, String)], project_default_style: Option<&str>) -> Vec<FileOutput> {
+    sync_project_inner(files, project_default_style, None).0
+}
+
+/// Same as `sync_project`, but consults `cache` for files whose content — and whose entire
+/// transitive ancestor chain's content — are unchanged since the run that produced it, skipping
+/// the numpydoc-parsing/MRO-merge/diagnostic-generation work for those files entirely (see
+/// `cache.rs` for exactly what is and isn't skipped, and why). `cache` is replaced with the
+/// updated cache reflecting this run — the caller is responsible for persisting it.
+pub fn sync_project_with_cache(files: &[(PathBuf, String)], project_default_style: Option<&str>, cache: &mut Cache) -> Vec<FileOutput> {
+    let (outputs, new_cache) = sync_project_inner(files, project_default_style, Some(&*cache));
+    *cache = new_cache;
+    outputs
+}
+
+fn sync_project_inner(
+    files: &[(PathBuf, String)],
+    project_default_style: Option<&str>,
+    old_cache: Option<&Cache>,
+) -> (Vec<FileOutput>, Cache) {
     let mut diagnostics_by_file: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
     let project = project::build_project(files, &mut diagnostics_by_file);
+    let file_by_path: HashMap<PathBuf, &ProjectFile> = project.files.iter().map(|f| (f.path.clone(), f)).collect();
+
+    let content_hash: HashMap<PathBuf, String> = files.iter().map(|(p, t)| (p.clone(), cache::hash_text(t))).collect();
+    let module_hash: HashMap<String, String> = project
+        .files
+        .iter()
+        .filter_map(|f| content_hash.get(&f.path).map(|h| (f.module_name.clone(), h.clone())))
+        .collect();
+    let module_names: Vec<String> = project.files.iter().map(|f| f.module_name.clone()).collect();
+    let global_key = cache::compute_global_key(project_default_style, &module_names);
+
+    let usable_old_cache = old_cache.filter(|c| !c.is_stale() && c.global_key == global_key);
 
     let mut memo: HashMap<ClassId, MethodViews> = HashMap::new();
-    let mut edits_by_file: HashMap<PathBuf, Vec<TextEdit>> = HashMap::new();
+    let mut cache_valid_files: HashSet<PathBuf> = HashSet::new();
 
+    if let Some(old) = usable_old_cache {
+        for file in &project.files {
+            let Some(hash) = content_hash.get(&file.path) else { continue };
+            let Some(cached_file) = old.files.get(&file.path) else { continue };
+            if &cached_file.content_hash == hash && cache::dependencies_still_valid(&cached_file.dependencies, &module_hash) {
+                cache_valid_files.insert(file.path.clone());
+                for (class_name, cached_views) in &cached_file.classes {
+                    let id = ClassId {
+                        module: file.module_name.clone(),
+                        name: class_name.clone(),
+                    };
+                    memo.insert(id, cache::cached_to_method_views(cached_views));
+                }
+            }
+        }
+    }
+
+    let mut edits_by_file: HashMap<PathBuf, Vec<TextEdit>> = HashMap::new();
     let class_ids: Vec<ClassId> = project
         .files
         .iter()
@@ -53,18 +103,77 @@ pub fn sync_project(files: &[(PathBuf, String)], project_default_style: Option<&
         resolve_and_rewrite(&project, id, project_default_style, &mut memo, &mut edits_by_file, &mut diagnostics_by_file);
     }
 
-    files
-        .iter()
-        .map(|(path, text)| {
-            let edits = edits_by_file.remove(path).unwrap_or_default();
-            let diagnostics = diagnostics_by_file.remove(path).unwrap_or_default();
-            FileOutput {
-                path: path.clone(),
-                text: apply_edits(text, edits),
-                diagnostics,
+    let mut new_cache_files: HashMap<PathBuf, cache::CachedFile> = HashMap::new();
+    let mut outputs = Vec::with_capacity(files.len());
+
+    for (path, text) in files {
+        if cache_valid_files.contains(path) {
+            if let Some(cached) = usable_old_cache.and_then(|old| old.files.get(path)) {
+                outputs.push(FileOutput {
+                    path: path.clone(),
+                    text: cached.output_text.clone(),
+                    diagnostics: cached.diagnostics.iter().map(cache::cached_to_diagnostic).collect(),
+                });
+                new_cache_files.insert(path.clone(), cached.clone());
+                continue;
             }
-        })
-        .collect()
+        }
+
+        let edits = edits_by_file.remove(path).unwrap_or_default();
+        let diagnostics = diagnostics_by_file.remove(path).unwrap_or_default();
+        let output_text = apply_edits(text, edits);
+
+        if let Some(&file) = file_by_path.get(path) {
+            let dependencies: Vec<(String, String)> = project::transitive_dependency_files(&project, file)
+                .iter()
+                .filter_map(|dep_path| {
+                    let dep_file = file_by_path.get(dep_path)?;
+                    let hash = content_hash.get(dep_path)?;
+                    Some((dep_file.module_name.clone(), hash.clone()))
+                })
+                .collect();
+
+            let classes: HashMap<String, cache::CachedMethodViews> = file
+                .model
+                .classes
+                .keys()
+                .map(|name| {
+                    let id = ClassId {
+                        module: file.module_name.clone(),
+                        name: name.clone(),
+                    };
+                    let views = memo.get(&id).cloned().unwrap_or_default();
+                    (name.clone(), cache::method_views_to_cached(&views))
+                })
+                .collect();
+
+            new_cache_files.insert(
+                path.clone(),
+                cache::CachedFile {
+                    content_hash: content_hash.get(path).cloned().unwrap_or_default(),
+                    dependencies,
+                    output_text: output_text.clone(),
+                    diagnostics: diagnostics.iter().map(cache::diagnostic_to_cached).collect(),
+                    classes,
+                },
+            );
+        }
+
+        outputs.push(FileOutput {
+            path: path.clone(),
+            text: output_text,
+            diagnostics,
+        });
+    }
+
+    let new_cache = Cache {
+        format_version: cache::CACHE_FORMAT_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        global_key,
+        files: new_cache_files,
+    };
+
+    (outputs, new_cache)
 }
 
 /// Single-file convenience wrapper over `sync_project`, kept for the common case (and every
@@ -1325,5 +1434,133 @@ class Solo:
         let (_output, diagnostics) = sync(source);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, "DOC007");
+    }
+
+    fn owned_files(pairs: &[(&str, &str)]) -> Vec<(PathBuf, String)> {
+        pairs.iter().map(|(p, t)| (PathBuf::from(p), t.to_string())).collect()
+    }
+
+    fn text_for<'a>(outputs: &'a [FileOutput], path: &str) -> &'a str {
+        &outputs.iter().find(|o| o.path == std::path::Path::new(path)).unwrap().text
+    }
+
+    #[test]
+    fn cached_run_matches_uncached_run() {
+        let files = owned_files(&[
+            ("pkg/__init__.py", ""),
+            ("pkg/base.py", BASE_PY),
+            ("pkg/child.py", &child_using("from .base import Base")),
+        ]);
+
+        let plain = sync_project(&files, None);
+        let mut cache = Cache::default();
+        let cached = sync_project_with_cache(&files, None, &mut cache);
+
+        assert_eq!(plain.len(), cached.len());
+        for (a, b) in plain.iter().zip(cached.iter()) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(a.text, b.text);
+            assert_eq!(a.diagnostics.len(), b.diagnostics.len());
+        }
+    }
+
+    #[test]
+    fn second_run_with_unchanged_files_reuses_cache_and_matches_first_run() {
+        let files = owned_files(&[
+            ("pkg/__init__.py", ""),
+            ("pkg/base.py", BASE_PY),
+            ("pkg/child.py", &child_using("from .base import Base")),
+        ]);
+
+        let mut cache = Cache::default();
+        let first = sync_project_with_cache(&files, None, &mut cache);
+        assert!(!cache.files.is_empty());
+
+        let second = sync_project_with_cache(&files, None, &mut cache);
+        assert_eq!(text_for(&first, "pkg/child.py"), text_for(&second, "pkg/child.py"));
+        assert!(text_for(&second, "pkg/child.py").contains("Arg1 doc, from Base."));
+    }
+
+    #[test]
+    fn cache_invalidates_a_descendant_when_only_the_ancestor_file_changes() {
+        let base_v1 = BASE_PY;
+        let base_v2 = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    arg1 : int
+        UPDATED description, from Base v2.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let child = child_using("from .base import Base");
+
+        // Round 1: nothing is cached yet, so child.py resyncs from its stale local text to
+        // match base_v1 immediately, same as any uncached run.
+        let files_v1 = owned_files(&[("pkg/__init__.py", ""), ("pkg/base.py", base_v1), ("pkg/child.py", &child)]);
+        let mut cache = Cache::default();
+        let first = sync_project_with_cache(&files_v1, None, &mut cache);
+        assert!(text_for(&first, "pkg/child.py").contains("Arg1 doc, from Base."));
+
+        // Round 2: only base.py's content changes. child.py's own text is byte-identical to
+        // round 1, but its dependency fingerprint (base.py's hash) no longer matches, so it
+        // must NOT be served from the stale cache entry -- it has to resync to base_v2.
+        let files_v2 = owned_files(&[("pkg/__init__.py", ""), ("pkg/base.py", base_v2), ("pkg/child.py", &child)]);
+        let second = sync_project_with_cache(&files_v2, None, &mut cache);
+
+        let child_output = text_for(&second, "pkg/child.py");
+        assert!(
+            child_output.contains("UPDATED description, from Base v2."),
+            "child should have resynced to the new ancestor text, got: {child_output}"
+        );
+        assert!(!child_output.contains("Stale text that should sync."));
+    }
+
+    #[test]
+    fn cache_is_invalidated_when_project_default_style_changes() {
+        let source = "\
+class Solo:
+    \"\"\"Solo.
+
+    Parameters
+    ----------
+    arg1 : int
+        Documented.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let files = owned_files(&[("solo.py", source)]);
+
+        let mut cache = Cache::default();
+        let first = sync_project_with_cache(&files, Some("numpydoc"), &mut cache);
+        assert!(first[0].diagnostics.is_empty());
+
+        // A different project-wide style default must not silently reuse the old cache entry
+        // (even though nothing here observably differs today, since only one style exists —
+        // the global key changing is what's under test, not a behavior difference).
+        let second = sync_project_with_cache(&files, Some("google"), &mut cache);
+        assert_eq!(second[0].diagnostics.len(), 1);
+        assert_eq!(second[0].diagnostics[0].code, "DOC011");
+    }
+
+    #[test]
+    fn stale_cache_format_version_is_ignored() {
+        let files = owned_files(&[("solo.py", BASE_PY)]);
+        let mut cache = Cache {
+            format_version: 999,
+            tool_version: "0.0.0-bogus".to_string(),
+            global_key: "irrelevant".to_string(),
+            files: HashMap::new(),
+        };
+        // Must not panic or misbehave -- just falls back to a full, correct recompute.
+        let outputs = sync_project_with_cache(&files, None, &mut cache);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(cache.format_version, cache::CACHE_FORMAT_VERSION);
     }
 }

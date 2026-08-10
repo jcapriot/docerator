@@ -132,3 +132,102 @@ fn exit_zero_flag_forces_success_despite_pending_changes() {
 
     Command::cargo_bin("docerator").unwrap().args(["--exit-zero"]).arg(dir.path()).assert().code(0);
 }
+
+#[test]
+fn cache_directory_is_created_and_self_gitignoring_by_default() {
+    let dir = write_project();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .args(["--fix"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    let cache_dir = dir.path().join(".docerator_cache");
+    assert!(cache_dir.join("cache.json").exists());
+    let gitignore = fs::read_to_string(cache_dir.join(".gitignore")).unwrap();
+    assert_eq!(gitignore.trim(), "*");
+}
+
+#[test]
+fn second_run_is_fully_cache_served_and_reports_zero_changes() {
+    let dir = write_project();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .args(["--fix"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .arg(dir.path())
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("0 files would change"));
+}
+
+#[test]
+fn editing_only_the_ancestor_file_still_triggers_a_resync_of_the_descendant_on_next_run() {
+    let dir = write_project();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .args(["--fix"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    let updated_base = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    arg1 : int
+        UPDATED via ancestor edit.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+    fs::write(dir.path().join("pkg/base.py"), updated_base).unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .args(["--fix"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    let child_text = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(child_text.contains("UPDATED via ancestor edit."));
+}
+
+#[test]
+fn no_cache_flag_skips_creating_a_cache_directory() {
+    let dir = write_project();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .args(["--no-cache", "--fix"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    assert!(!dir.path().join(".docerator_cache").exists());
+}

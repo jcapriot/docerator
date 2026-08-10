@@ -1,3 +1,4 @@
+mod cache_io;
 mod config;
 mod report;
 
@@ -7,7 +8,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use docerator_core::style::Severity;
-use docerator_core::sync::sync_project;
+use docerator_core::sync::{sync_project, sync_project_with_cache};
 
 /// Static NumPy-docstring parameter sync for Python class hierarchies.
 #[derive(Parser, Debug)]
@@ -56,11 +57,11 @@ struct Cli {
     #[arg(long)]
     exit_zero: bool,
 
-    /// Reserved for the on-disk persistent cache fast-follow; currently a no-op.
+    /// Directory for the on-disk incremental cache. Defaults to `<project-root>/.docerator_cache`.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
 
-    /// Reserved alongside `--cache-dir`; currently a no-op (there is no cache yet to disable).
+    /// Disable the on-disk cache entirely (neither read nor write it).
     #[arg(long, conflicts_with = "cache_dir")]
     no_cache: bool,
 }
@@ -81,7 +82,7 @@ enum ColorChoice {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let _ = (&cli.src, cli.cache_dir.as_ref(), cli.no_cache, cli.color); // reserved, not yet consulted
+    let _ = (&cli.src, cli.color); // reserved, not yet consulted
 
     let project_root = cli
         .project_root
@@ -120,7 +121,16 @@ fn main() -> ExitCode {
         }
     }
 
-    let outputs = sync_project(&files, project_config.style.as_deref());
+    let cache_dir = (!cli.no_cache).then(|| cache_io::resolve_cache_dir(cli.cache_dir.as_deref(), &project_root));
+
+    let outputs = if let Some(cache_dir) = &cache_dir {
+        let mut cache = cache_io::load(cache_dir);
+        let outputs = sync_project_with_cache(&files, project_config.style.as_deref(), &mut cache);
+        cache_io::save(cache_dir, &cache);
+        outputs
+    } else {
+        sync_project(&files, project_config.style.as_deref())
+    };
     let original_by_path: std::collections::HashMap<&PathBuf, &String> = files.iter().map(|(p, t)| (p, t)).collect();
 
     let mut changed_paths: Vec<PathBuf> = Vec::new();

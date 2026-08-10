@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod directives;
 pub mod docstring;
 pub mod edit;

@@ -225,6 +225,35 @@ pub fn resolve_base_ref(project: &ProjectModel, file: &ProjectFile, base_ref: &B
     }
 }
 
+/// Every file transitively reachable from `file`'s own classes by following base-class chains
+/// (across files), including `file` itself — the on-disk cache's dependency fingerprint for
+/// `file`: if any of these files' content changes, `file`'s resolved output could change too,
+/// even though `file`'s own text didn't.
+pub fn transitive_dependency_files(project: &ProjectModel, file: &ProjectFile) -> Vec<PathBuf> {
+    let mut visited_modules = HashSet::new();
+    let mut result = Vec::new();
+    let mut stack = vec![file.module_name.clone()];
+
+    while let Some(module) = stack.pop() {
+        if !visited_modules.insert(module.clone()) {
+            continue;
+        }
+        let Some(f) = project.file_for_module(&module) else {
+            continue;
+        };
+        result.push(f.path.clone());
+        for class in f.model.classes.values() {
+            for base_ref in &class.base_refs {
+                if let Some(ancestor_id) = resolve_base_ref(project, f, base_ref) {
+                    stack.push(ancestor_id.module);
+                }
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

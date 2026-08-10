@@ -1,0 +1,17 @@
+[package]
+name = "docerator-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "docerator"
+path = "src/main.rs"
+
+[dependencies]
+docerator-core = { path = "../docerator-core" }
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+
+[dev-dependencies]
+assert_cmd = "2"

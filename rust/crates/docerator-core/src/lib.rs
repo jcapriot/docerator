@@ -3,6 +3,7 @@ pub mod docstring;
 pub mod edit;
 pub mod model;
 pub mod parse;
+pub mod project;
 pub mod source;
 pub mod style;
 pub mod sync;

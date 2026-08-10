@@ -1,7 +1,8 @@
-//! Extracts a per-class, per-method model (signature + docstring location) from a parsed file —
-//! the input the auto-sync engine (`sync.rs`) needs. M2 scope: same-file base-class resolution
-//! only (a base class expression that isn't a plain `Name` in this file is simply unresolvable
-//! and treated as no ancestor); cross-file resolution is deferred to a later milestone.
+//! Extracts a per-class, per-method model (signature + docstring location) from a single parsed
+//! file — the input `project.rs` assembles into a whole-project view and `sync.rs` consumes.
+//! This module only ever looks at ONE file's own AST; it records base-class expressions and
+//! import statements in a form `project.rs` can resolve against the *whole* project afterward —
+//! it never itself decides whether a name is same-file, cross-file, or unresolvable.
 
 use indexmap::IndexMap;
 use ruff_python_ast::{Expr, ModModule, Stmt, StmtClassDef, StmtFunctionDef};
@@ -9,6 +10,44 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::directives::{self, Directives};
 use crate::style::Diagnostic;
+
+/// A base-class expression, exactly as written, in a form cheap to resolve later without
+/// re-inspecting the AST: `class Foo(Bar):` -> `Name("Bar")`; `class Foo(pkg.sub.Bar):` ->
+/// `Attribute(["pkg", "sub", "Bar"])`. Anything else (a call expression, a subscript, ...) is
+/// dynamic and never resolvable — `project.rs` treats it as opaque, no diagnostic (it was never
+/// going to be a statically-known class).
+#[derive(Debug, Clone)]
+pub enum BaseRef {
+    Name(String),
+    /// Dotted attribute chain, e.g. `pkg.sub.Bar` -> `["pkg", "sub", "Bar"]`. The last segment
+    /// is always the class name; everything before it is a module path to resolve through the
+    /// leading segment's import binding.
+    Attribute(Vec<String>),
+}
+
+/// One `import`/`from ... import ...` statement's contribution to this file's local namespace.
+#[derive(Debug, Clone)]
+pub enum ImportedSymbol {
+    /// `import a.b.c` (binds `a`) or `import a.b.c as x` (binds `x`) — the local name refers to
+    /// a whole module; a later `name.attr` attribute access resolves `attr` within it.
+    Module(String),
+    /// `from a.b import c` (binds `c`) or `from a.b import c as d` (binds `d`) — the local name
+    /// refers to one specific symbol inside that module, which may itself be a re-export
+    /// (`project.rs` follows the chain).
+    Name { module: ImportSource, name: String },
+}
+
+/// Where a `from ... import ...`'s module comes from — resolving relative imports needs the
+/// importing file's own package identity, which only `project.rs` (whole-project view) has, so
+/// this stores the raw ingredients rather than a resolved dotted name.
+#[derive(Debug, Clone)]
+pub enum ImportSource {
+    /// `from a.b import c` — an absolute dotted module path.
+    Absolute(String),
+    /// `from . import c` / `from .sib import c` / `from ..pkg import c` — `level` dots (1 = the
+    /// current package) and an optional trailing dotted submodule path (`None` for `from . import c`).
+    Relative { level: u32, submodule: Option<String> },
+}
 
 #[derive(Debug, Clone)]
 pub struct DocstringInfo {
@@ -37,12 +76,14 @@ pub struct MethodModel {
     pub directives: Directives,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ClassModel {
-    pub base_names: Vec<String>,
+    pub base_refs: Vec<BaseRef>,
     pub methods: IndexMap<String, MethodModel>,
     /// Directives from a `# docerator:` comment directly above the class itself.
     pub directives: Directives,
+    /// The `class` statement's own range — used to anchor diagnostics about its base classes.
+    pub range: TextRange,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -51,6 +92,10 @@ pub struct FileModel {
     /// The project-wide-style-equivalent default declared at file scope: the last
     /// `# docerator: style=...` comment appearing before the first top-level class/function.
     pub file_level_style: Option<String>,
+    /// Local-name -> imported-symbol bindings from every top-level `import`/`from ... import`
+    /// statement (not ones nested inside a function/class/if/try body — base classes are
+    /// realistically always resolved against plain module-level imports).
+    pub imports: IndexMap<String, ImportedSymbol>,
 }
 
 pub fn build_file_model(source: &str, module: &ModModule, diagnostics: &mut Vec<Diagnostic>) -> FileModel {
@@ -65,7 +110,68 @@ pub fn build_file_model(source: &str, module: &ModModule, diagnostics: &mut Vec<
     let file_level_style =
         first_top_level_def_start.and_then(|offset| directives::file_level_style(source, offset));
 
-    FileModel { classes, file_level_style }
+    let imports = collect_imports(&module.body);
+
+    FileModel { classes, file_level_style, imports }
+}
+
+fn collect_imports(body: &[Stmt]) -> IndexMap<String, ImportedSymbol> {
+    let mut imports = IndexMap::new();
+    for stmt in body {
+        match stmt {
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let dotted = alias.name.to_string();
+                    match &alias.asname {
+                        // `import a.b.c as x` binds `x` directly to the full target module —
+                        // `x` IS `a.b.c`, nothing to walk.
+                        Some(asname) => {
+                            imports.insert(asname.to_string(), ImportedSymbol::Module(dotted));
+                        }
+                        // `import a.b.c` (no `as`) binds only the top-level name `a`, to module
+                        // `a` itself — `a.b`/`a.b.c` are only reachable afterward via attribute
+                        // access through `a` (Python sets submodules as attributes of their
+                        // parent package on import), which `project.rs`'s attribute-chain
+                        // resolution walks starting from THIS binding, so it must point at just
+                        // `a`, not the full dotted path.
+                        None => {
+                            let top_level = dotted.split('.').next().unwrap_or(&dotted).to_string();
+                            imports.insert(top_level.clone(), ImportedSymbol::Module(top_level));
+                        }
+                    }
+                }
+            }
+            Stmt::ImportFrom(import_from) => {
+                let module_path = import_from.module.as_ref().map(|m| m.to_string());
+                let source = if import_from.level > 0 {
+                    ImportSource::Relative {
+                        level: import_from.level,
+                        submodule: module_path,
+                    }
+                } else {
+                    ImportSource::Absolute(module_path.unwrap_or_default())
+                };
+                for alias in &import_from.names {
+                    let imported_name = alias.name.to_string();
+                    if imported_name == "*" {
+                        // Star imports are dynamic/unbounded -- never resolvable, and don't
+                        // bind any specific local name we could look up later.
+                        continue;
+                    }
+                    let local_name = alias.asname.as_ref().map(|a| a.to_string()).unwrap_or_else(|| imported_name.clone());
+                    imports.insert(
+                        local_name,
+                        ImportedSymbol::Name {
+                            module: source.clone(),
+                            name: imported_name,
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    imports
 }
 
 fn collect_classes(source: &str, body: &[Stmt], out: &mut IndexMap<String, ClassModel>, diagnostics: &mut Vec<Diagnostic>) {
@@ -84,10 +190,10 @@ fn collect_classes(source: &str, body: &[Stmt], out: &mut IndexMap<String, Class
 }
 
 fn build_class_model(source: &str, class_def: &StmtClassDef, diagnostics: &mut Vec<Diagnostic>) -> ClassModel {
-    let base_names = class_def
+    let base_refs = class_def
         .arguments
         .as_ref()
-        .map(|args| args.args.iter().filter_map(simple_name).collect())
+        .map(|args| args.args.iter().filter_map(base_ref).collect())
         .unwrap_or_default();
 
     let class_docstring = leading_docstring(source, &class_def.body);
@@ -126,15 +232,34 @@ fn build_class_model(source: &str, class_def: &StmtClassDef, diagnostics: &mut V
     }
 
     ClassModel {
-        base_names,
+        base_refs,
         methods,
         directives: class_directives,
+        range: class_def.range(),
     }
 }
 
-fn simple_name(expr: &Expr) -> Option<String> {
+/// `Bar` -> `Name("Bar")`; `pkg.sub.Bar` -> `Attribute(["pkg", "sub", "Bar"])`; anything else
+/// (a call, subscript, etc.) is a dynamic base expression and never resolvable, so `None`.
+fn base_ref(expr: &Expr) -> Option<BaseRef> {
     match expr {
-        Expr::Name(name) => Some(name.id.to_string()),
+        Expr::Name(name) => Some(BaseRef::Name(name.id.to_string())),
+        Expr::Attribute(_) => flatten_attribute_chain(expr).map(BaseRef::Attribute),
+        _ => None,
+    }
+}
+
+/// Walks a (possibly nested) `Expr::Attribute` chain rooted in an `Expr::Name` into its
+/// dotted-segment form, e.g. `pkg.sub.Bar` -> `["pkg", "sub", "Bar"]`. Returns `None` if the
+/// chain doesn't bottom out in a plain name (e.g. `foo().Bar`).
+fn flatten_attribute_chain(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Name(name) => Some(vec![name.id.to_string()]),
+        Expr::Attribute(attr) => {
+            let mut segments = flatten_attribute_chain(&attr.value)?;
+            segments.push(attr.attr.to_string());
+            Some(segments)
+        }
         _ => None,
     }
 }

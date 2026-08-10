@@ -1,40 +1,86 @@
 //! The auto-sync engine: for every named signature parameter an ancestor documents, regenerate
 //! (or insert) that entry's text every run so it always matches the nearest ancestor that
-//! authored it. M2 scope was single-file, same-file base-class resolution with no directives —
-//! M3 adds `# docerator:` directive handling: `skip` (exempt an entity, its content still flows
-//! to descendants as-is), `override=` (a name is authored here, never auto-managed, regardless
-//! of what an ancestor says), and `style=` resolution through entity → file → project → hard
-//! default. Still single-file; cross-file resolution is a later milestone.
+//! authored it. M3 added `# docerator:` directives (`skip`, `override=`, `style=`); M4 added
+//! `expand_kwargs`/`exclude=`; M5 makes ancestor resolution project-wide instead of same-file-
+//! only: a base class reached through a relative import, an absolute import (src-layout aware —
+//! see `project.rs`), or a name re-exported through a package's `__init__.py` all resolve the
+//! same way a same-file base class always did. `sync_source` (single file) is now a thin
+//! wrapper around `sync_project` (the one real implementation) with a synthetic one-file project.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use indexmap::IndexMap;
 use ruff_text_size::{TextRange, TextSize};
 
 use crate::edit::{apply_edits, TextEdit};
-use crate::model::{self, ClassModel, FileModel, MethodModel};
+use crate::model::{self, ClassModel, MethodModel};
 use crate::parse;
+use crate::project::{self, ClassId, ProjectFile, ProjectModel};
 use crate::style::numpydoc::NumpydocStyle;
 use crate::style::{Diagnostic, DocStyle, ParamEntry, Severity};
 
+pub struct FileOutput {
+    pub path: PathBuf,
+    pub text: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Sync every class across every file in `files` against the whole project's inheritance graph.
+/// `files` should already be `.py` files only — filtering out anything else (and walking a real
+/// directory tree in the first place) is the CLI's job, not this library's.
+pub fn sync_project(files: &[(PathBuf, String)], project_default_style: Option<&str>) -> Vec<FileOutput> {
+    let mut diagnostics_by_file: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
+    let project = project::build_project(files, &mut diagnostics_by_file);
+
+    let mut memo: HashMap<ClassId, MethodViews> = HashMap::new();
+    let mut edits_by_file: HashMap<PathBuf, Vec<TextEdit>> = HashMap::new();
+
+    let class_ids: Vec<ClassId> = project
+        .files
+        .iter()
+        .flat_map(|f| {
+            f.model
+                .classes
+                .keys()
+                .map(move |name| ClassId {
+                    module: f.module_name.clone(),
+                    name: name.clone(),
+                })
+        })
+        .collect();
+    for id in &class_ids {
+        resolve_and_rewrite(&project, id, project_default_style, &mut memo, &mut edits_by_file, &mut diagnostics_by_file);
+    }
+
+    files
+        .iter()
+        .map(|(path, text)| {
+            let edits = edits_by_file.remove(path).unwrap_or_default();
+            let diagnostics = diagnostics_by_file.remove(path).unwrap_or_default();
+            FileOutput {
+                path: path.clone(),
+                text: apply_edits(text, edits),
+                diagnostics,
+            }
+        })
+        .collect()
+}
+
+/// Single-file convenience wrapper over `sync_project`, kept for the common case (and every
+/// existing single-file test) — a lone file behaves exactly as it always did, since an
+/// unresolvable/absent import for a base class falls back to the same same-file lookup this
+/// used before M5.
 pub fn sync_source(
     source: &str,
     project_default_style: Option<&str>,
 ) -> Result<(String, Vec<Diagnostic>), ruff_python_parser::ParseError> {
-    let parsed = parse::parse(source)?;
-    let mut diagnostics = Vec::new();
-    let file_model = model::build_file_model(source, parsed.syntax(), &mut diagnostics);
-
-    let mut memo: HashMap<String, MethodViews> = HashMap::new();
-    let mut edits = Vec::new();
-
-    let class_names: Vec<String> = file_model.classes.keys().cloned().collect();
-    for name in &class_names {
-        resolve_and_rewrite(&file_model, name, project_default_style, &mut memo, &mut edits, &mut diagnostics);
-    }
-
-    let output = apply_edits(source, edits);
-    Ok((output, diagnostics))
+    parse::parse(source)?;
+    let path = PathBuf::from("<source>.py");
+    let files = [(path.clone(), source.to_string())];
+    let mut outputs = sync_project(&files, project_default_style);
+    let output = outputs.pop().expect("sync_project returns one output per input file");
+    Ok((output.text, output.diagnostics))
 }
 
 /// Per method name, the full flattened "most-derived-that-defines-it wins" view of every entry
@@ -43,27 +89,49 @@ pub fn sync_source(
 type MethodViews = IndexMap<String, IndexMap<String, ParamEntry>>;
 
 fn resolve_and_rewrite(
-    file: &FileModel,
-    class_name: &str,
+    project: &ProjectModel,
+    class_id: &ClassId,
     project_default_style: Option<&str>,
-    memo: &mut HashMap<String, MethodViews>,
-    edits: &mut Vec<TextEdit>,
-    diagnostics: &mut Vec<Diagnostic>,
+    memo: &mut HashMap<ClassId, MethodViews>,
+    edits_by_file: &mut HashMap<PathBuf, Vec<TextEdit>>,
+    diagnostics_by_file: &mut HashMap<PathBuf, Vec<Diagnostic>>,
 ) -> MethodViews {
-    if let Some(cached) = memo.get(class_name) {
+    if let Some(cached) = memo.get(class_id) {
         return cached.clone();
     }
 
-    let class = &file.classes[class_name];
-    let parent_view: MethodViews = class
-        .base_names
-        .iter()
-        .find(|base| file.classes.contains_key(base.as_str()))
-        .map(|base_name| {
-            resolve_and_rewrite(file, base_name, project_default_style, memo, edits, diagnostics)
-        })
+    let Some((file, class)) = project.class(class_id) else {
+        return IndexMap::new();
+    };
+
+    let mut ancestor_id: Option<ClassId> = None;
+    for base_ref in &class.base_refs {
+        let was_imported = base_ref_head_is_imported(file, base_ref);
+        match project::resolve_base_ref(project, file, base_ref) {
+            Some(resolved) if ancestor_id.is_none() => {
+                ancestor_id = Some(resolved);
+            }
+            Some(_) => {}
+            None if was_imported => {
+                diagnostics_by_file.entry(file.path.clone()).or_default().push(Diagnostic {
+                    code: "DOC002",
+                    severity: Severity::Info,
+                    message: "base class import could not be statically resolved within the project \
+                              (external/stdlib dependency, or genuinely not found) — treated as opaque"
+                        .to_string(),
+                    range: class.range,
+                });
+            }
+            None => {}
+        }
+    }
+
+    let parent_view: MethodViews = ancestor_id
+        .map(|id| resolve_and_rewrite(project, &id, project_default_style, memo, edits_by_file, diagnostics_by_file))
         .unwrap_or_default();
 
+    let edits = edits_by_file.entry(file.path.clone()).or_default();
+    let diagnostics = diagnostics_by_file.entry(file.path.clone()).or_default();
     let mut this_view: MethodViews = IndexMap::new();
 
     for (method_name, method) in &class.methods {
@@ -85,7 +153,7 @@ fn resolve_and_rewrite(
                     range: doc.inner_range,
                 });
             } else {
-                let style_name = effective_style_name(class, method_name, method, file.file_level_style.as_deref(), project_default_style);
+                let style_name = effective_style_name(class, method_name, method, file.model.file_level_style.as_deref(), project_default_style);
                 let style = resolve_style(&style_name, doc.inner_range, diagnostics);
                 let (parsed_entries, parse_diagnostics) = style.parse_entries(&doc.text);
 
@@ -199,8 +267,25 @@ fn resolve_and_rewrite(
         this_view.insert(method_name.clone(), resolved);
     }
 
-    memo.insert(class_name.to_string(), this_view.clone());
+    memo.insert(class_id.clone(), this_view.clone());
     this_view
+}
+
+/// Whether a base-class reference's leading name (the whole name for `BaseRef::Name`, the first
+/// segment for `BaseRef::Attribute`) corresponds to an actual `import` statement in this file —
+/// distinguishes "this was a deliberate reference to something outside the project" (worth a
+/// quiet DOC002) from "this is just a builtin/not-tracked name" (worth nothing at all; `object`,
+/// `Exception`, `dict`, etc. are never imported, and diagnosing every one of those would be pure
+/// noise).
+fn base_ref_head_is_imported(file: &ProjectFile, base_ref: &model::BaseRef) -> bool {
+    let head = match base_ref {
+        model::BaseRef::Name(name) => name.as_str(),
+        model::BaseRef::Attribute(segments) => match segments.first() {
+            Some(first) => first.as_str(),
+            None => return false,
+        },
+    };
+    file.model.imports.contains_key(head)
 }
 
 /// `override=` is scoped per entity, with one exception: a class-level directive applies to the
@@ -408,6 +493,14 @@ mod tests {
 
     fn sync(source: &str) -> (String, Vec<Diagnostic>) {
         sync_source(source, None).expect("fixture must parse")
+    }
+
+    fn sync_multi(files: &[(&str, &str)]) -> HashMap<String, FileOutput> {
+        let owned: Vec<(PathBuf, String)> = files.iter().map(|(p, t)| (PathBuf::from(p), t.to_string())).collect();
+        sync_project(&owned, None)
+            .into_iter()
+            .map(|out| (out.path.to_string_lossy().replace('\\', "/"), out))
+            .collect()
     }
 
     #[test]
@@ -1022,5 +1115,151 @@ class Child(Parent):
         assert_eq!(diagnostics[0].code, "DOC006");
         assert!(output.contains("Other Parameters"));
         assert!(output.contains("extra1"));
+    }
+
+    const BASE_PY: &str = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc, from Base.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+
+    fn child_using(base_import: &str) -> String {
+        format!(
+            "\
+{base_import}
+
+
+class Child(Base):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should sync from Base.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+"
+        )
+    }
+
+    #[test]
+    fn resolves_base_class_through_relative_sibling_import() {
+        let child = child_using("from .base import Base");
+        let outputs = sync_multi(&[("pkg/__init__.py", ""), ("pkg/base.py", BASE_PY), ("pkg/child.py", &child)]);
+
+        let child_out = &outputs["pkg/child.py"];
+        assert!(child_out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", child_out.diagnostics);
+        assert!(child_out.text.contains("Arg1 doc, from Base."));
+        assert!(!child_out.text.contains("Stale text"));
+    }
+
+    #[test]
+    fn resolves_base_class_through_relative_parent_package_import() {
+        // pkg/sub/child.py reaching up two levels to pkg/base.py
+        let child = child_using("from ..base import Base");
+        let outputs = sync_multi(&[
+            ("pkg/__init__.py", ""),
+            ("pkg/base.py", BASE_PY),
+            ("pkg/sub/__init__.py", ""),
+            ("pkg/sub/child.py", &child),
+        ]);
+
+        let child_out = &outputs["pkg/sub/child.py"];
+        assert!(child_out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", child_out.diagnostics);
+        assert!(child_out.text.contains("Arg1 doc, from Base."));
+    }
+
+    #[test]
+    fn resolves_base_class_through_absolute_import_in_src_layout() {
+        // The package's own name ("mypkg") must be discovered despite the "src/" container
+        // directory, since that's what the absolute import actually names.
+        let child = child_using("from mypkg.base import Base");
+        let outputs = sync_multi(&[
+            ("src/mypkg/__init__.py", ""),
+            ("src/mypkg/base.py", BASE_PY),
+            ("src/mypkg/child.py", &child),
+        ]);
+
+        let child_out = &outputs["src/mypkg/child.py"];
+        assert!(child_out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", child_out.diagnostics);
+        assert!(child_out.text.contains("Arg1 doc, from Base."));
+    }
+
+    #[test]
+    fn resolves_base_class_through_attribute_access_on_an_imported_module() {
+        let child = child_using("import pkg.base");
+        // `import pkg.base` then `class Child(pkg.base.Base):` -- rewrite the base line since
+        // `child_using` wrote a bare `Base`.
+        let child = child.replacen("class Child(Base):", "class Child(pkg.base.Base):", 1);
+        let outputs = sync_multi(&[("pkg/__init__.py", ""), ("pkg/base.py", BASE_PY), ("pkg/child.py", &child)]);
+
+        let child_out = &outputs["pkg/child.py"];
+        assert!(child_out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", child_out.diagnostics);
+        assert!(child_out.text.contains("Arg1 doc, from Base."));
+    }
+
+    #[test]
+    fn follows_a_reexport_through_init_py() {
+        // pkg/__init__.py re-exports Base from pkg/_internal.py; usage.py imports it from the
+        // package itself, never knowing (or needing to know) where Base is really defined.
+        let internal_py = BASE_PY; // defines `Base` directly
+        let init_py = "from ._internal import Base\n";
+        let usage_py = child_using("from pkg import Base");
+
+        let outputs = sync_multi(&[
+            ("pkg/__init__.py", init_py),
+            ("pkg/_internal.py", internal_py),
+            ("usage.py", &usage_py),
+        ]);
+
+        let usage_out = &outputs["usage.py"];
+        assert!(usage_out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", usage_out.diagnostics);
+        assert!(usage_out.text.contains("Arg1 doc, from Base."));
+    }
+
+    #[test]
+    fn unresolvable_import_is_diagnosed_as_opaque_and_leaves_file_untouched() {
+        let child = child_using("from numpy import ndarray");
+        let child = child.replacen("class Child(Base):", "class Child(ndarray):", 1);
+        let outputs = sync_multi(&[("usage.py", &child)]);
+
+        let out = &outputs["usage.py"];
+        assert_eq!(out.text, child);
+        assert_eq!(out.diagnostics.len(), 1);
+        assert_eq!(out.diagnostics[0].code, "DOC002");
+    }
+
+    #[test]
+    fn bare_unimported_base_name_like_a_builtin_is_silent() {
+        // `class Child(Exception):` -- Exception was never imported, so this must NOT be
+        // diagnosed (matches every real class inheriting from a builtin/stdlib type with no
+        // import statement at all).
+        let source = "\
+class Child(Exception):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Documented.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let outputs = sync_multi(&[("usage.py", source)]);
+        let out = &outputs["usage.py"];
+        assert_eq!(out.text, source);
+        assert!(out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", out.diagnostics);
     }
 }

@@ -1,7 +1,10 @@
 pub mod docstring;
 pub mod edit;
+pub mod model;
 pub mod parse;
 pub mod source;
+pub mod style;
+pub mod sync;
 
 pub use edit::TextEdit;
 pub use source::SourceFile;

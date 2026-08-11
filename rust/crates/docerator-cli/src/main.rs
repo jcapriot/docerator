@@ -1,6 +1,7 @@
 mod cache_io;
 mod config;
 mod report;
+mod rules;
 
 use std::fs;
 use std::path::PathBuf;
@@ -8,7 +9,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use docerator_core::style::Severity;
-use docerator_core::sync::{sync_project, sync_project_with_cache};
+use docerator_core::sync::{sync_project_with_cache_and_options, sync_project_with_options, SyncOptions};
+use rules::RuleLevel;
 
 /// Static NumPy-docstring parameter sync for Python class hierarchies.
 #[derive(Parser, Debug)]
@@ -64,6 +66,19 @@ struct Cli {
     /// Disable the on-disk cache entirely (neither read nor write it).
     #[arg(long, conflicts_with = "cache_dir")]
     no_cache: bool,
+
+    /// Override a diagnostic code's severity, `CODE=LEVEL` (e.g. `--rule DOC001=error`).
+    /// LEVEL is one of `off` (suppress entirely), `info`, `warning`, or `error`. Repeatable.
+    /// Mirrors `[tool.docerator.rules]` in `pyproject.toml`; a code given both ways uses this
+    /// flag's value.
+    #[arg(long = "rule", value_parser = rules::parse_rule_arg)]
+    rule: Vec<(String, RuleLevel)>,
+
+    /// When a class inherits a parameter with no `Parameters` section to insert it into (DOC010),
+    /// synthesize one from scratch instead of only diagnosing the gap. Mirrors
+    /// `insert_missing_sections` in `[tool.docerator]`; either source turning it on is enough.
+    #[arg(long)]
+    insert_missing_sections: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -123,14 +138,29 @@ fn main() -> ExitCode {
 
     let cache_dir = (!cli.no_cache).then(|| cache_io::resolve_cache_dir(cli.cache_dir.as_deref(), &project_root));
 
-    let outputs = if let Some(cache_dir) = &cache_dir {
+    let sync_options = SyncOptions {
+        project_default_style: project_config.style.as_deref(),
+        insert_missing_sections: cli.insert_missing_sections || project_config.insert_missing_sections.unwrap_or(false),
+    };
+
+    let mut outputs = if let Some(cache_dir) = &cache_dir {
         let mut cache = cache_io::load(cache_dir);
-        let outputs = sync_project_with_cache(&files, project_config.style.as_deref(), &mut cache);
+        let outputs = sync_project_with_cache_and_options(&files, sync_options, &mut cache);
         cache_io::save(cache_dir, &cache);
         outputs
     } else {
-        sync_project(&files, project_config.style.as_deref())
+        sync_project_with_options(&files, sync_options)
     };
+
+    // Severity overrides are a pure reporting-layer concern (never affect what edits the sync
+    // engine computed above, only which diagnostics are shown and at what level) -- applied here,
+    // after the cache save, so what's persisted to disk always reflects default severities and
+    // stays reusable across runs with different `--rule` flags.
+    let rule_overrides = rules::merge(&project_config.rules, &cli.rule);
+    for output in &mut outputs {
+        rules::apply(&mut output.diagnostics, &rule_overrides);
+    }
+
     let original_by_path: std::collections::HashMap<&PathBuf, &String> = files.iter().map(|(p, t)| (p, t)).collect();
 
     let mut changed_paths: Vec<PathBuf> = Vec::new();

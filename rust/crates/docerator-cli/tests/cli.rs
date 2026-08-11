@@ -231,3 +231,168 @@ fn no_cache_flag_skips_creating_a_cache_directory() {
 
     assert!(!dir.path().join(".docerator_cache").exists());
 }
+
+const UNDOCUMENTED_PARAM_PY: &str = "\
+class Standalone:
+    \"\"\"Standalone.
+
+    Parameters
+    ----------
+    arg1 : int
+        Documented.
+    \"\"\"
+
+    def __init__(self, arg1, arg2):
+        pass
+";
+
+#[test]
+fn doc001_is_a_warning_by_default_and_does_not_fail_the_run() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("solo.py"), UNDOCUMENTED_PARAM_PY).unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .arg(dir.path())
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("DOC001 warning"));
+}
+
+#[test]
+fn rule_flag_promotes_a_code_to_error_and_fails_the_run() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("solo.py"), UNDOCUMENTED_PARAM_PY).unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--rule", "DOC001=error"])
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("DOC001 error"));
+}
+
+#[test]
+fn rule_flag_off_suppresses_the_diagnostic_entirely() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("solo.py"), UNDOCUMENTED_PARAM_PY).unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--rule", "DOC001=off"])
+        .arg(dir.path())
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("DOC001").not());
+}
+
+#[test]
+fn pyproject_rules_table_promotes_a_code_to_error_without_any_cli_flag() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("solo.py"), UNDOCUMENTED_PARAM_PY).unwrap();
+    fs::write(dir.path().join("pyproject.toml"), "[tool.docerator.rules]\nDOC001 = \"error\"\n").unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("DOC001 error"));
+}
+
+#[test]
+fn cli_rule_flag_overrides_a_conflicting_pyproject_setting_for_the_same_code() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("solo.py"), UNDOCUMENTED_PARAM_PY).unwrap();
+    fs::write(dir.path().join("pyproject.toml"), "[tool.docerator.rules]\nDOC001 = \"warning\"\n").unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .args(["--rule", "DOC001=error"])
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("DOC001 error"));
+}
+
+#[test]
+fn unknown_code_in_rule_flag_warns_on_stderr_but_does_not_fail_the_run() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("solo.py"), UNDOCUMENTED_PARAM_PY).unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--rule", "DOC099=error"])
+        .arg(dir.path())
+        .assert()
+        .code(0)
+        .stderr(predicate::str::contains("DOC099").and(predicate::str::contains("not a known diagnostic code")));
+}
+
+const CHILD_PY_NO_PARAMETERS_SECTION: &str = "\
+from .base import Base
+
+
+class Child(Base):
+    \"\"\"Child.
+
+    Does some child-specific things.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+
+fn write_project_with_no_parameters_section() -> tempfile::TempDir {
+    let dir = tempdir().expect("create tempdir");
+    let pkg = dir.path().join("pkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(pkg.join("base.py"), BASE_PY).unwrap();
+    fs::write(pkg.join("child.py"), CHILD_PY_NO_PARAMETERS_SECTION).unwrap();
+    dir
+}
+
+#[test]
+fn doc010_is_only_diagnosed_by_default_when_no_parameters_section_exists() {
+    let dir = write_project_with_no_parameters_section();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .arg(dir.path())
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("DOC010"));
+
+    let child_text = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert_eq!(child_text, CHILD_PY_NO_PARAMETERS_SECTION, "must not write without the flag");
+}
+
+#[test]
+fn insert_missing_sections_flag_synthesizes_the_section_via_fix() {
+    let dir = write_project_with_no_parameters_section();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--insert-missing-sections", "--fix"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    let child_text = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(child_text.contains("Parameters\n    ----------\n    arg1 : int\n        Arg1 doc, from Base."));
+
+    // Second run: fully in sync now, nothing left to change or diagnose.
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--insert-missing-sections"])
+        .arg(dir.path())
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("0 files would change"));
+}

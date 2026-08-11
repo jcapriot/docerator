@@ -13,6 +13,12 @@ pub struct ParamEntry {
     pub type_description: Option<String>,
     pub description: Option<String>,
     pub range: TextRange,
+    /// Whether this entry's own docstring was a raw (`r"""`) literal. Stamped in by the caller
+    /// after parsing (parsing itself is style-agnostic and doesn't know the source docstring's
+    /// prefix) — `false` at construction time inside a `DocStyle` impl. Used to guard copying an
+    /// entry containing a backslash into a docstring with *different* raw-ness, where the same
+    /// bytes would carry different escape semantics.
+    pub is_raw: bool,
 }
 
 /// The result of parsing one docstring's parameter-documenting section(s), normalized to two
@@ -25,6 +31,23 @@ pub struct ParamEntry {
 pub struct ParsedEntries {
     pub primary: IndexMap<String, ParamEntry>,
     pub secondary: IndexMap<String, ParamEntry>,
+    /// Whether a `Parameters` section header was found at all, independent of whether any
+    /// entries parsed under it (that's `primary.is_empty()`, a distinct case — a present-but-
+    /// empty header is a malformed-indentation problem, diagnosed as `DOC005`, and must never be
+    /// treated as "missing" or a second header would get synthesized right on top of it).
+    pub has_primary_section: bool,
+    /// Byte offset (relative to the parsed docstring text) of the first recognized section's own
+    /// header line, of *any* kind — `Parameters`, `Returns`, `Notes`, whichever appears first in
+    /// the text — or `None` if no section was recognized at all. Since `Parameters` is always the
+    /// canonically-first section, this is exactly where a synthesized `Parameters` section needs
+    /// to be inserted *before* to land in valid canonical order; `None` means there's nothing to
+    /// insert before, so it belongs at the end of the docstring's own content instead.
+    pub first_section_start: Option<usize>,
+    /// The whitespace prefix shared by every section-header and arg-name line in this docstring
+    /// (`compute_margin`'s result, rendered as a literal string) — the indentation a freshly
+    /// synthesized section's own lines need, since there's no existing entry to borrow it from
+    /// when the section doesn't exist yet at all.
+    pub margin_indent: String,
 }
 
 impl ParsedEntries {
@@ -45,6 +68,15 @@ impl ParsedEntries {
     pub fn is_empty(&self) -> bool {
         self.primary.is_empty() && self.secondary.is_empty()
     }
+
+    /// Stamp every entry's `is_raw` with the raw-ness of the docstring they were just parsed
+    /// out of — parsing itself is style-agnostic and has no notion of the source literal's `r`
+    /// prefix, so the caller (which does know) fills this in right after `parse_entries` returns.
+    pub fn set_is_raw(&mut self, is_raw: bool) {
+        for entry in self.primary.values_mut().chain(self.secondary.values_mut()) {
+            entry.is_raw = is_raw;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +93,27 @@ pub struct Diagnostic {
     pub message: String,
     pub range: TextRange,
 }
+
+/// Every diagnostic code this tool can emit, paired with the severity it's constructed with at
+/// its own call site — the single source of truth both `cache::static_code` (recovering a
+/// `'static` code after a cache round-trip) and the CLI's rule-configuration validation
+/// (`--rule`/`[tool.docerator.rules]`, checking a user-supplied code is real) key off of, so
+/// adding a new `DOC0NN` diagnostic elsewhere only ever requires updating this one list to stay
+/// consistent everywhere else that needs to enumerate "every known code".
+pub const KNOWN_DIAGNOSTIC_CODES: &[(&str, Severity)] = &[
+    ("DOC001", Severity::Warning),
+    ("DOC002", Severity::Info),
+    ("DOC003", Severity::Error),
+    ("DOC004", Severity::Error),
+    ("DOC005", Severity::Warning),
+    ("DOC006", Severity::Warning),
+    ("DOC007", Severity::Warning),
+    ("DOC008", Severity::Warning),
+    ("DOC009", Severity::Warning),
+    ("DOC010", Severity::Warning),
+    ("DOC011", Severity::Warning),
+    ("DOC012", Severity::Error),
+];
 
 /// Which of the two parameter-doc roles the auto-sync engine cares about, independent of how
 /// any particular style spells them (numpydoc: `Parameters` / `Other Parameters`).
@@ -79,9 +132,11 @@ pub trait DocStyle {
     fn parse_entries(&self, docstring_text: &str) -> (ParsedEntries, Vec<Diagnostic>);
 
     /// Render one entry back into this style's on-disk text, at the caller-supplied ambient
-    /// indentation. Not yet implemented — needed starting M2, when entries are spliced back
-    /// into real files.
-    fn format_entry(&self, entry: &ParamEntry, indent: &str) -> String;
+    /// indentation, using `newline` (`"\n"` or `"\r\n"`) for any line break the rendering itself
+    /// introduces (e.g. between a `name : type` line and its description) — the caller owns
+    /// deciding which convention matches the file actually being written to, since a
+    /// style-agnostic renderer has no way to know that on its own.
+    fn format_entry(&self, entry: &ParamEntry, indent: &str, newline: &str) -> String;
 
     /// Text needed to create the relevant section from scratch, for an entity that has no
     /// existing section to append an auto-managed entry into. Not yet implemented.

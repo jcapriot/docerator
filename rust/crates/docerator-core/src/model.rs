@@ -55,6 +55,13 @@ pub struct DocstringInfo {
     pub inner_range: TextRange,
     /// The interior text, verbatim (escapes not decoded).
     pub text: String,
+    /// Whether the literal has an `r`/`R` prefix (`r"""..."""`). Since docerator always splices
+    /// raw source bytes and never decodes escapes, a backslash is only ever a real hazard when
+    /// text gets copied *between* two docstrings whose raw-ness differs — the same bytes mean
+    /// different things depending on which kind of literal they land in. Tracked here so that
+    /// check can be scoped to exactly that situation instead of refusing to touch any docstring
+    /// that merely contains a `\` anywhere, including in prose nowhere near a documented entry.
+    pub is_raw: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -290,20 +297,23 @@ fn leading_docstring(source: &str, body: &[Stmt]) -> Option<DocstringInfo> {
     let Expr::StringLiteral(string_lit) = expr_stmt.value.as_ref() else {
         return None;
     };
-    let (inner_range, text) = docstring_inner(source, string_lit.range())?;
+    let (inner_range, text, is_raw) = docstring_inner(source, string_lit.range())?;
     Some(DocstringInfo {
         inner_range,
         text: text.to_string(),
+        is_raw,
     })
 }
 
 /// Given a string-literal node's full range (quotes included), find the byte range and text of
 /// its interior, handling `"""`/`'''`/`"`/`'` with an optional alphabetic prefix (`r`, `f`, `u`,
-/// `b`, and combinations). Returns `None` for shapes we don't recognize (should not happen for
-/// a literal `ruff_python_ast` itself already classified as a string literal).
-fn docstring_inner(source: &str, literal_range: TextRange) -> Option<(TextRange, &str)> {
+/// `b`, and combinations), plus whether that prefix marks the literal as raw. Returns `None` for
+/// shapes we don't recognize (should not happen for a literal `ruff_python_ast` itself already
+/// classified as a string literal).
+fn docstring_inner(source: &str, literal_range: TextRange) -> Option<(TextRange, &str, bool)> {
     let full = &source[usize::from(literal_range.start())..usize::from(literal_range.end())];
     let prefix_len = full.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let is_raw = full[..prefix_len].bytes().any(|b| b == b'r' || b == b'R');
     let rest = &full[prefix_len..];
     let quote_len = if rest.starts_with("\"\"\"") || rest.starts_with("'''") {
         3
@@ -320,5 +330,5 @@ fn docstring_inner(source: &str, literal_range: TextRange) -> Option<(TextRange,
     let inner_text = &full[inner_start..inner_end];
     let abs_start = literal_range.start() + TextSize::try_from(inner_start).unwrap();
     let abs_end = literal_range.start() + TextSize::try_from(inner_end).unwrap();
-    Some((TextRange::new(abs_start, abs_end), inner_text))
+    Some((TextRange::new(abs_start, abs_end), inner_text, is_raw))
 }

@@ -27,11 +27,40 @@ pub struct FileOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Engine-wide behavior knobs beyond the per-file/per-entity `# docerator:` directives — plain
+/// fields rather than a builder since there are only a couple so far; grows here rather than as
+/// more positional parameters on `sync_project`/`sync_project_with_cache` as new project-wide
+/// options are added.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SyncOptions<'a> {
+    pub project_default_style: Option<&'a str>,
+    /// When a class inherits a parameter that isn't documented locally and the docstring has no
+    /// `Parameters` section at all to insert it into (`DOC010`), synthesize one from scratch
+    /// instead of only diagnosing the gap. Off by default — creating a new section is a more
+    /// opinionated, structural edit than this tool's usual "only ever resync what's already
+    /// there" default, so it's opt-in.
+    pub insert_missing_sections: bool,
+}
+
+impl<'a> SyncOptions<'a> {
+    pub fn with_style(project_default_style: Option<&'a str>) -> Self {
+        Self {
+            project_default_style,
+            insert_missing_sections: false,
+        }
+    }
+}
+
 /// Sync every class across every file in `files` against the whole project's inheritance graph.
 /// `files` should already be `.py` files only — filtering out anything else (and walking a real
 /// directory tree in the first place) is the CLI's job, not this library's.
 pub fn sync_project(files: &[(PathBuf, String)], project_default_style: Option<&str>) -> Vec<FileOutput> {
-    sync_project_inner(files, project_default_style, None).0
+    sync_project_with_options(files, SyncOptions::with_style(project_default_style))
+}
+
+/// Same as `sync_project`, but with the full `SyncOptions` set rather than just a style default.
+pub fn sync_project_with_options(files: &[(PathBuf, String)], options: SyncOptions) -> Vec<FileOutput> {
+    sync_project_inner(files, options, None).0
 }
 
 /// Same as `sync_project`, but consults `cache` for files whose content — and whose entire
@@ -40,16 +69,18 @@ pub fn sync_project(files: &[(PathBuf, String)], project_default_style: Option<&
 /// `cache.rs` for exactly what is and isn't skipped, and why). `cache` is replaced with the
 /// updated cache reflecting this run — the caller is responsible for persisting it.
 pub fn sync_project_with_cache(files: &[(PathBuf, String)], project_default_style: Option<&str>, cache: &mut Cache) -> Vec<FileOutput> {
-    let (outputs, new_cache) = sync_project_inner(files, project_default_style, Some(&*cache));
+    sync_project_with_cache_and_options(files, SyncOptions::with_style(project_default_style), cache)
+}
+
+/// Same as `sync_project_with_cache`, but with the full `SyncOptions` set rather than just a
+/// style default.
+pub fn sync_project_with_cache_and_options(files: &[(PathBuf, String)], options: SyncOptions, cache: &mut Cache) -> Vec<FileOutput> {
+    let (outputs, new_cache) = sync_project_inner(files, options, Some(&*cache));
     *cache = new_cache;
     outputs
 }
 
-fn sync_project_inner(
-    files: &[(PathBuf, String)],
-    project_default_style: Option<&str>,
-    old_cache: Option<&Cache>,
-) -> (Vec<FileOutput>, Cache) {
+fn sync_project_inner(files: &[(PathBuf, String)], options: SyncOptions, old_cache: Option<&Cache>) -> (Vec<FileOutput>, Cache) {
     let mut diagnostics_by_file: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
     let project = project::build_project(files, &mut diagnostics_by_file);
     let file_by_path: HashMap<PathBuf, &ProjectFile> = project.files.iter().map(|f| (f.path.clone(), f)).collect();
@@ -61,7 +92,7 @@ fn sync_project_inner(
         .filter_map(|f| content_hash.get(&f.path).map(|h| (f.module_name.clone(), h.clone())))
         .collect();
     let module_names: Vec<String> = project.files.iter().map(|f| f.module_name.clone()).collect();
-    let global_key = cache::compute_global_key(project_default_style, &module_names);
+    let global_key = cache::compute_global_key(options.project_default_style, options.insert_missing_sections, &module_names);
 
     let usable_old_cache = old_cache.filter(|c| !c.is_stale() && c.global_key == global_key);
 
@@ -100,7 +131,15 @@ fn sync_project_inner(
         })
         .collect();
     for id in &class_ids {
-        resolve_and_rewrite(&project, id, project_default_style, &mut memo, &mut edits_by_file, &mut diagnostics_by_file);
+        resolve_and_rewrite(
+            &project,
+            id,
+            options.project_default_style,
+            options.insert_missing_sections,
+            &mut memo,
+            &mut edits_by_file,
+            &mut diagnostics_by_file,
+        );
     }
 
     let mut new_cache_files: HashMap<PathBuf, cache::CachedFile> = HashMap::new();
@@ -184,11 +223,19 @@ pub fn sync_source(
     source: &str,
     project_default_style: Option<&str>,
 ) -> Result<(String, Vec<Diagnostic>), ruff_python_parser::ParseError> {
+    sync_source_with_options(source, SyncOptions::with_style(project_default_style))
+}
+
+/// Same as `sync_source`, but with the full `SyncOptions` set rather than just a style default.
+pub fn sync_source_with_options(
+    source: &str,
+    options: SyncOptions,
+) -> Result<(String, Vec<Diagnostic>), ruff_python_parser::ParseError> {
     parse::parse(source)?;
     let path = PathBuf::from("<source>.py");
     let files = [(path.clone(), source.to_string())];
-    let mut outputs = sync_project(&files, project_default_style);
-    let output = outputs.pop().expect("sync_project returns one output per input file");
+    let mut outputs = sync_project_with_options(&files, options);
+    let output = outputs.pop().expect("sync_project_with_options returns one output per input file");
     Ok((output.text, output.diagnostics))
 }
 
@@ -201,6 +248,7 @@ fn resolve_and_rewrite(
     project: &ProjectModel,
     class_id: &ClassId,
     project_default_style: Option<&str>,
+    insert_missing_sections: bool,
     memo: &mut HashMap<ClassId, MethodViews>,
     edits_by_file: &mut HashMap<PathBuf, Vec<TextEdit>>,
     diagnostics_by_file: &mut HashMap<PathBuf, Vec<Diagnostic>>,
@@ -236,12 +284,28 @@ fn resolve_and_rewrite(
     }
 
     let parent_view: MethodViews = ancestor_id
-        .map(|id| resolve_and_rewrite(project, &id, project_default_style, memo, edits_by_file, diagnostics_by_file))
+        .map(|id| {
+            resolve_and_rewrite(
+                project,
+                &id,
+                project_default_style,
+                insert_missing_sections,
+                memo,
+                edits_by_file,
+                diagnostics_by_file,
+            )
+        })
         .unwrap_or_default();
 
     let edits = edits_by_file.entry(file.path.clone()).or_default();
     let diagnostics = diagnostics_by_file.entry(file.path.clone()).or_default();
-    let mut this_view: MethodViews = IndexMap::new();
+    // Seed from the ancestor's own resolved view *before* overlaying this class's locally
+    // defined methods, so a method this class doesn't override at all (e.g. `class Parent(GrandParent): pass`,
+    // no `__init__` of its own) stays transparently visible to further descendants — matching
+    // Python's real MRO, where such a class doesn't hide `GrandParent.__init__` from `Child`.
+    // Without this, a non-overriding ancestor would silently erase every parameter documented
+    // above it in the chain.
+    let mut this_view: MethodViews = parent_view.clone();
 
     for (method_name, method) in &class.methods {
         let inherited_from_ancestors = parent_view.get(method_name).cloned().unwrap_or_default();
@@ -252,19 +316,17 @@ fn resolve_and_rewrite(
         let mut authored: IndexMap<String, ParamEntry> = IndexMap::new();
 
         if let Some(doc) = &method.docstring {
-            if doc.text.contains('\\') {
-                diagnostics.push(Diagnostic {
-                    code: "DOC008",
-                    severity: Severity::Error,
-                    message: "docstring contains a backslash escape; rewriting is unsupported \
-                              for this entity in v1"
-                        .to_string(),
-                    range: doc.inner_range,
-                });
-            } else {
+            {
                 let style_name = effective_style_name(class, method_name, method, file.model.file_level_style.as_deref(), project_default_style);
                 let style = resolve_style(&style_name, doc.inner_range, diagnostics);
-                let (parsed_entries, parse_diagnostics) = style.parse_entries(&doc.text);
+                let (mut parsed_entries, parse_diagnostics) = style.parse_entries(&doc.text);
+                // Docerator never decodes escape sequences -- it always splices raw source
+                // bytes, so a `\` by itself is harmless. The only real hazard is copying text
+                // *between* two docstrings with different raw-ness (`r"""..."""` vs `"""..."""`),
+                // where the same bytes carry different escape semantics -- guarded per-entry,
+                // right where that copying actually happens (`format_entry` call sites below),
+                // not by refusing to touch an entire docstring for containing a `\` anywhere.
+                parsed_entries.set_is_raw(doc.is_raw);
 
                 if effective_skip {
                     // Exempt: no edits, no diagnostics about this entity's own structure — but
@@ -308,59 +370,172 @@ fn resolve_and_rewrite(
                         });
                     }
 
+                    // Rebuild the whole `Parameters` block in signature order every run, rather
+                    // than splicing each entry in place / appending new ones at the end — a
+                    // per-entry edit can only say "replace this text" or "insert at one fixed
+                    // point," neither of which can express "this entry needs to move before
+                    // one that's already there," which is exactly what's needed both for a
+                    // freshly-auto-filled entry (it might belong in the middle of the section,
+                    // not at the end) and for pre-existing entries a human wrote in some other
+                    // order (extremely common in code that predates this tool). Comparing the
+                    // freshly-built block against what's already there before emitting an edit
+                    // keeps this a no-op whenever nothing actually needs to change.
+                    let mut ordered_names: Vec<String> = Vec::new();
                     for name in &method.signature.names {
                         if effective_overrides.contains(name) {
+                            if parsed_entries.primary.contains_key(name) {
+                                ordered_names.push(name.clone());
+                            }
                             continue;
                         }
-                        match (parsed_entries.get(name), inherited_from_ancestors.get(name)) {
-                            (_, Some(ancestor_entry)) => {
-                                let new_text = style.format_entry(ancestor_entry, "");
-                                match parsed_entries.get(name) {
-                                    Some(existing)
-                                        if existing.type_description == ancestor_entry.type_description
-                                            && existing.description == ancestor_entry.description =>
-                                    {
-                                        // already in sync, nothing to splice
-                                    }
-                                    Some(existing) => {
-                                        edits.push(TextEdit::new(
-                                            offset_range(existing.range, doc.inner_range.start()),
-                                            new_text,
-                                        ));
-                                    }
-                                    None => match append_point(&parsed_entries.primary, &doc.text) {
-                                        Some((insertion, indent)) => {
-                                            let at = doc.inner_range.start() + TextSize::try_from(insertion).unwrap();
-                                            edits.push(TextEdit::new(
-                                                TextRange::new(at, at),
-                                                format!("\n{indent}{new_text}"),
-                                            ));
+                        if inherited_from_ancestors.contains_key(name) || parsed_entries.primary.contains_key(name) {
+                            ordered_names.push(name.clone());
+                        } else {
+                            diagnostics.push(Diagnostic {
+                                code: "DOC001",
+                                severity: Severity::Warning,
+                                message: format!(
+                                    "parameter '{name}' is not documented locally and no ancestor documents it"
+                                ),
+                                range: doc.inner_range,
+                            });
+                        }
+                    }
+                    // Anything documented locally but not actually part of the signature (a
+                    // stray/legacy entry) keeps its original relative order, appended after
+                    // every signature-ordered entry -- there's no signature position for it to
+                    // match, so "leave it where it already reads naturally" is the only sane
+                    // default.
+                    for name in parsed_entries.primary.keys() {
+                        if !ordered_names.iter().any(|n| n == name) {
+                            ordered_names.push(name.clone());
+                        }
+                    }
+
+                    match primary_block_span(&parsed_entries.primary, &doc.text) {
+                        Some((block_range, indent)) => {
+                            let newline = newline_style(&doc.text);
+                            let pieces: Vec<String> = ordered_names
+                                .iter()
+                                .map(|name| {
+                                    if !effective_overrides.contains(name) {
+                                        if let Some(ancestor_entry) = inherited_from_ancestors.get(name) {
+                                            let candidate = style.format_entry(ancestor_entry, "", newline);
+                                            if safe_to_copy_across_raw_ness(ancestor_entry.is_raw, doc.is_raw, &candidate) {
+                                                return candidate;
+                                            }
+                                            diagnostics.push(backslash_raw_mismatch_diagnostic(name, doc.inner_range));
                                         }
-                                        None => {
-                                            diagnostics.push(Diagnostic {
-                                                code: "DOC010",
-                                                severity: Severity::Warning,
-                                                message: format!(
-                                                    "parameter '{name}' is inherited but this docstring has no \
-                                                     Parameters section to insert it into yet"
-                                                ),
-                                                range: doc.inner_range,
-                                            });
+                                    }
+                                    // Authored (overridden, locally-new, or a non-signature
+                                    // extra): preserve the exact on-disk text untouched.
+                                    match parsed_entries.primary.get(name) {
+                                        Some(existing) => {
+                                            doc.text[usize::from(existing.range.start())..usize::from(existing.range.end())]
+                                                .to_string()
                                         }
-                                    },
+                                        None => String::new(),
+                                    }
+                                })
+                                .collect();
+
+                            let mut new_block = String::new();
+                            for (i, piece) in pieces.iter().enumerate() {
+                                if i > 0 {
+                                    // Two entries that were already directly adjacent, in the
+                                    // same order, keep whatever gap originally separated them
+                                    // (including any blank line an author put there) — the tool
+                                    // never touches formatting it didn't need to move. Only a
+                                    // pair that's actually being reordered around (at least one
+                                    // side didn't exist before, or they weren't neighbors) falls
+                                    // back to the tool's own plain single-newline separator.
+                                    let gap = original_gap_if_still_adjacent(
+                                        &ordered_names[i - 1],
+                                        &ordered_names[i],
+                                        &parsed_entries.primary,
+                                        &doc.text,
+                                    )
+                                    .unwrap_or_else(|| format!("{newline}{indent}"));
+                                    new_block.push_str(&gap);
+                                }
+                                new_block.push_str(piece);
+                            }
+
+                            let current_block =
+                                &doc.text[usize::from(block_range.start())..usize::from(block_range.end())];
+                            if new_block != current_block {
+                                edits.push(TextEdit::new(offset_range(block_range, doc.inner_range.start()), new_block));
+                            }
+                        }
+                        None => {
+                            let missing_names: Vec<&String> = ordered_names
+                                .iter()
+                                .filter(|name| {
+                                    !effective_overrides.contains(*name)
+                                        && inherited_from_ancestors.contains_key(*name)
+                                        && !parsed_entries.primary.contains_key(*name)
+                                })
+                                .collect();
+
+                            // `insert_missing_sections` is only trusted when there's no
+                            // `Parameters` header at all (`primary_block_span` also returns
+                            // `None` for a *present* header whose entries came out malformed or
+                            // non-monotonic -- see its own doc comment -- and synthesizing a
+                            // second header on top of either would either duplicate it outright
+                            // or splice against bookkeeping we've already decided not to trust),
+                            // and only when `margin_indent` is non-empty: an empty margin means
+                            // `compute_margin` had nothing indented to measure at all (most
+                            // commonly a single-line docstring, `"""Just a summary."""`, with no
+                            // other content whose indentation a synthesized section could borrow)
+                            // -- inserting at column 0 would produce a section visibly misindented
+                            // relative to the rest of the docstring, worse than just diagnosing.
+                            if insert_missing_sections
+                                && !missing_names.is_empty()
+                                && !parsed_entries.has_primary_section
+                                && !parsed_entries.margin_indent.is_empty()
+                            {
+                                let newline = newline_style(&doc.text);
+                                let indent = &parsed_entries.margin_indent;
+                                let raw_header = style.synthesize_section(crate::style::ParamSectionKind::Primary);
+                                let indented_header: String =
+                                    raw_header.lines().map(|line| format!("{indent}{line}{newline}")).collect();
+
+                                let mut body = String::new();
+                                for (i, name) in missing_names.iter().enumerate() {
+                                    if i > 0 {
+                                        body.push_str(newline);
+                                    }
+                                    body.push_str(indent);
+                                    let ancestor_entry = inherited_from_ancestors.get(*name).expect("filtered to inherited names above");
+                                    body.push_str(&style.format_entry(ancestor_entry, "", newline));
+                                }
+
+                                let (insertion_point, text) = match parsed_entries.first_section_start {
+                                    // Inserting directly ahead of an existing section: its own
+                                    // leading blank line (already in the source, right before
+                                    // this offset) becomes the separator from our new entries,
+                                    // so we only need a trailing blank line of our own.
+                                    Some(offset) => (offset, format!("{indented_header}{body}{newline}{newline}")),
+                                    // No other section exists at all: append at the end of the
+                                    // docstring's own content, providing our own leading blank
+                                    // line since nothing else supplies one.
+                                    None => (doc.text.trim_end().len(), format!("{newline}{newline}{indented_header}{body}")),
+                                };
+                                let at = doc.inner_range.start() + TextSize::try_from(insertion_point).unwrap();
+                                edits.push(TextEdit::new(TextRange::new(at, at), text));
+                            } else {
+                                for name in missing_names {
+                                    diagnostics.push(Diagnostic {
+                                        code: "DOC010",
+                                        severity: Severity::Warning,
+                                        message: format!(
+                                            "parameter '{name}' is inherited but this docstring has no \
+                                             Parameters section to insert it into yet"
+                                        ),
+                                        range: doc.inner_range,
+                                    });
                                 }
                             }
-                            (None, None) => {
-                                diagnostics.push(Diagnostic {
-                                    code: "DOC001",
-                                    severity: Severity::Warning,
-                                    message: format!(
-                                        "parameter '{name}' is not documented locally and no ancestor documents it"
-                                    ),
-                                    range: doc.inner_range,
-                                });
-                            }
-                            (Some(_), None) => {}
                         }
                     }
 
@@ -375,8 +550,11 @@ fn resolve_and_rewrite(
                                 &parsed_entries,
                                 &doc.text,
                                 doc.inner_range.start(),
+                                doc.is_raw,
+                                doc.inner_range,
                                 &style,
                                 edits,
+                                diagnostics,
                             );
                         }
                     }
@@ -503,12 +681,123 @@ fn resolve_style(name: &str, range: TextRange, diagnostics: &mut Vec<Diagnostic>
 fn append_point(section_entries: &IndexMap<String, ParamEntry>, docstring_text: &str) -> Option<(usize, String)> {
     let last = section_entries.values().max_by_key(|e| e.range.end())?;
     let insertion = usize::from(last.range.end());
-    let line_start = docstring_text[..usize::from(last.range.start())]
-        .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let indent = docstring_text[line_start..usize::from(last.range.start())].to_string();
+    let indent = line_indent_before(docstring_text, usize::from(last.range.start()));
     Some((insertion, indent))
+}
+
+/// The whitespace between the start of `offset`'s own line and `offset` itself — used to
+/// recover a line's indentation from an entry's own `range.start()` (which, by design, always
+/// starts right after that indentation, not before it).
+fn line_indent_before(docstring_text: &str, offset: usize) -> String {
+    let line_start = docstring_text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    docstring_text[line_start..offset].to_string()
+}
+
+/// `"\r\n"` if `docstring_text` already uses CRLF line endings anywhere, else plain `"\n"` — for
+/// a separator the tool synthesizes itself (no original text to copy the terminator from). Only
+/// ever needed when reusing an *existing* gap verbatim isn't possible (see
+/// `original_gap_if_still_adjacent`); every other line ending in a rewritten docstring comes
+/// from either untouched surrounding text or a raw entry slice, both already carrying whatever
+/// terminator the source file actually uses. Getting this wrong doesn't corrupt content, but it
+/// does quietly mix line-ending conventions within one file wherever it fires.
+fn newline_style(docstring_text: &str) -> &'static str {
+    if docstring_text.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Whether `rendered` (an ancestor entry's own formatted text) is safe to splice, as-is, into a
+/// docstring whose own raw-ness is `target_is_raw`. Docerator always splices raw source bytes and
+/// never decodes escapes, so text moving between two docstrings of the *same* raw-ness carries
+/// identical escape semantics on both sides regardless of what characters it contains — a `\` is
+/// only ever a hazard when raw-ness actually *differs* (the same bytes would mean something
+/// different re-interpreted in the other kind of literal) and the text actually contains one.
+fn safe_to_copy_across_raw_ness(ancestor_is_raw: bool, target_is_raw: bool, rendered: &str) -> bool {
+    ancestor_is_raw == target_is_raw || !rendered.contains('\\')
+}
+
+/// The DOC008 diagnostic for a specific parameter whose ancestor-regenerated text was withheld
+/// by `safe_to_copy_across_raw_ness` — narrower than the blanket "docstring contains a backslash"
+/// refusal this replaced: only the one unsafe *entry* is left untouched (whatever's already on
+/// disk, or simply not inserted), not the whole docstring's worth of otherwise-unrelated entries.
+fn backslash_raw_mismatch_diagnostic(name: &str, range: TextRange) -> Diagnostic {
+    Diagnostic {
+        code: "DOC008",
+        severity: Severity::Warning,
+        message: format!(
+            "parameter '{name}' is documented with a backslash in an ancestor whose docstring's \
+             raw-string-ness (`r\"\"\"...\"\"\"` vs `\"\"\"...\"\"\"`) differs from this one's — \
+             copying it verbatim would change what the backslash means, so it was left as-is; \
+             resolve by matching raw-ness or documenting it locally with `override=`"
+        ),
+        range,
+    }
+}
+
+/// The byte range spanning every existing `Parameters` entry, from the start of the first one
+/// (in source order) through the end of the last, plus the shared indentation to re-anchor
+/// every rebuilt line to (every entry in a section is required to sit at the same margin, so
+/// any one of them gives the right answer for all of them). `None` when the section has no
+/// entries at all yet — nothing to rebuild against — or when the entries aren't in well-formed,
+/// non-overlapping text order (see below) — nothing safe to rebuild against.
+///
+/// The rebuild this anchors assumes `entries`' iteration (insertion) order matches its ranges'
+/// text order, since it uses index-adjacency to decide which original gaps to preserve. That
+/// assumption can break on real-world, non-numpydoc-conformant input: a docstring section header
+/// the parser doesn't recognize (e.g. `Example` where only the plural `Examples` is canonical)
+/// leaves everything after it parsed as part of the *previous* recognized section's body, so
+/// unrelated prose gets mis-parsed as bogus "parameter" entries — and if two of those bogus
+/// entries happen to collide on the same literal name (e.g. two `.. code-block:: python`
+/// directives), `IndexMap::insert` overwrites the earlier one's *range* in place without moving
+/// its *position*, leaving that index pointing at a much-later span while a still-earlier index
+/// points earlier in the text. Rather than try to rebuild against that corrupted bookkeeping
+/// (previously an observed panic against real SimPEG source), bail out and leave the docstring
+/// untouched — the same "don't touch what wasn't understood" stance the parser already takes
+/// elsewhere (e.g. DOC008's backslash-skip).
+fn primary_block_span(entries: &IndexMap<String, ParamEntry>, docstring_text: &str) -> Option<(TextRange, String)> {
+    let first = entries.values().next()?;
+    let last = entries.values().last()?;
+    let mut prev_end = first.range.start();
+    for entry in entries.values() {
+        if entry.range.start() < prev_end {
+            return None;
+        }
+        prev_end = entry.range.end();
+    }
+    let indent = line_indent_before(docstring_text, usize::from(first.range.start()));
+    Some((TextRange::new(first.range.start(), last.range.end()), indent))
+}
+
+/// When rebuilding a `Parameters` block in signature order, two consecutive entries that were
+/// *already* directly next to each other, in the same order, on disk get to keep whatever text
+/// originally separated them (including any blank line an author put there) instead of the
+/// tool's own plain `"\n{indent}"` separator. `None` whenever the pair is actually being
+/// reordered around — either name is new, or they weren't neighbors before — in which case the
+/// caller falls back to the default separator, since there's no original gap to preserve.
+fn original_gap_if_still_adjacent(
+    prev_name: &str,
+    next_name: &str,
+    entries: &IndexMap<String, ParamEntry>,
+    docstring_text: &str,
+) -> Option<String> {
+    let prev_index = entries.get_index_of(prev_name)?;
+    let next_index = entries.get_index_of(next_name)?;
+    if next_index != prev_index + 1 {
+        return None;
+    }
+    let (_, prev_entry) = entries.get_index(prev_index)?;
+    let (_, next_entry) = entries.get_index(next_index)?;
+    let start = usize::from(prev_entry.range.end());
+    let end = usize::from(next_entry.range.start());
+    if start > end {
+        // Defensive only: `primary_block_span`'s own well-formedness check already keeps the
+        // caller from reaching this function with a corrupted (non-monotonic) `entries` map, but
+        // this helper shouldn't assume it'll only ever be called from there.
+        return None;
+    }
+    Some(docstring_text[start..end].to_string())
 }
 
 /// Pulls ancestor-documented parameters that aren't literally named in the local signature into
@@ -527,8 +816,11 @@ fn expand_kwargs(
     parsed_entries: &crate::style::ParsedEntries,
     docstring_text: &str,
     inner_range_start: TextSize,
+    target_is_raw: bool,
+    doc_range: TextRange,
     style: &NumpydocStyle,
     edits: &mut Vec<TextEdit>,
+    diagnostics: &mut Vec<Diagnostic>,
 ) {
     use crate::style::ParamSectionKind;
 
@@ -537,6 +829,7 @@ fn expand_kwargs(
         ParamSectionKind::Secondary => &parsed_entries.secondary,
     };
 
+    let newline = newline_style(docstring_text);
     let named: HashSet<&str> = signature_names.iter().map(String::as_str).collect();
     let mut pending_inserts: Vec<String> = Vec::new();
 
@@ -544,7 +837,11 @@ fn expand_kwargs(
         if named.contains(name.as_str()) || effective_overrides.contains(name) || effective_exclude.contains(name) {
             continue;
         }
-        let new_text = style.format_entry(ancestor_entry, "");
+        let new_text = style.format_entry(ancestor_entry, "", newline);
+        if !safe_to_copy_across_raw_ness(ancestor_entry.is_raw, target_is_raw, &new_text) {
+            diagnostics.push(backslash_raw_mismatch_diagnostic(name, doc_range));
+            continue;
+        }
         match target_entries.get(name) {
             Some(existing)
                 if existing.type_description == ancestor_entry.type_description
@@ -583,8 +880,9 @@ fn expand_kwargs(
         (insertion, indent, String::new())
     } else if let Some((insertion, indent)) = fallback_anchor {
         let raw_header = style.synthesize_section(target);
-        let indented_header: String = raw_header.lines().map(|line| format!("{indent}{line}\n")).collect();
-        (insertion, indent, format!("\n{indented_header}"))
+        let indented_header: String =
+            raw_header.lines().map(|line| format!("{indent}{line}{newline}")).collect();
+        (insertion, indent, format!("{newline}{indented_header}"))
     } else {
         // No anchor at all -- nothing sensible to append to yet.
         return;
@@ -598,7 +896,7 @@ fn expand_kwargs(
             // (from its underline's own line) — go straight to the indent, no extra blank line.
             text.push_str(&indent);
         } else {
-            text.push('\n');
+            text.push_str(newline);
             text.push_str(&indent);
         }
         text.push_str(entry_text);
@@ -623,6 +921,14 @@ mod tests {
 
     fn sync(source: &str) -> (String, Vec<Diagnostic>) {
         sync_source(source, None).expect("fixture must parse")
+    }
+
+    fn sync_inserting_missing_sections(source: &str) -> (String, Vec<Diagnostic>) {
+        let options = SyncOptions {
+            project_default_style: None,
+            insert_missing_sections: true,
+        };
+        sync_source_with_options(source, options).expect("fixture must parse")
     }
 
     fn sync_multi(files: &[(&str, &str)]) -> HashMap<String, FileOutput> {
@@ -691,10 +997,10 @@ class Child(Parent):
     ----------
     arg1 : int
         The first argument, straight from Parent.
-    extra : bool
-        This one is genuinely new to Child and must be left alone.
     arg2 : str
         The second argument, also from Parent.
+    extra : bool
+        This one is genuinely new to Child and must be left alone.
     \"\"\"
 
     def __init__(self, arg1, arg2, extra):
@@ -1562,5 +1868,574 @@ class Solo:
         let outputs = sync_project_with_cache(&files, None, &mut cache);
         assert_eq!(outputs.len(), 1);
         assert_eq!(cache.format_version, cache::CACHE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn method_view_passes_through_an_ancestor_that_does_not_override_it() {
+        // Parent doesn't define __init__ at all -- Python's real MRO still reaches
+        // Grandparent.__init__ transparently through it, so Child must too.
+        let source = "\
+class Grandparent:
+    \"\"\"Grandparent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc, from Grandparent.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Parent(Grandparent):
+    pass
+
+
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should sync from Grandparent, through the non-overriding Parent.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert!(output.contains("Arg1 doc, from Grandparent."));
+        assert!(!output.contains("Stale text that should sync"));
+    }
+
+    #[test]
+    fn leading_blank_line_in_ancestor_description_is_reproduced_when_synced() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+
+        Description with a blank line above it, as written by the author.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child_section = &output[output.find("class Child").unwrap()..];
+        assert!(child_section.contains("arg1 : int\n\n        Description with a blank line above it"));
+    }
+
+    #[test]
+    fn trailing_blank_line_before_the_next_parameter_is_never_touched_by_a_splice() {
+        // A blank line the author left between arg1's description and arg2's header, WITHIN
+        // the same section (not the last-entry-before-next-section case), must survive a
+        // splice of arg1 untouched -- it was never part of arg1's own range to begin with.
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Fresh text from Parent.
+    arg2 : str
+        Arg2 doc.
+    \"\"\"
+
+    def __init__(self, arg1, arg2):
+        pass
+
+
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should sync.
+
+    arg2 : str
+        Arg2 doc.
+    \"\"\"
+
+    def __init__(self, arg1, arg2):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child_section = &output[output.find("class Child").unwrap()..];
+        // arg1 resynced, and the blank line the author left before arg2 is still there.
+        assert!(child_section.contains("Fresh text from Parent.\n\n    arg2 : str"));
+    }
+
+    #[test]
+    fn parameters_are_reordered_to_match_the_signature_and_a_pair_left_adjacent_keeps_its_original_gap() {
+        // Docstring order is arg1, arg3, arg4, arg2 -- signature order is arg1, arg2, arg3, arg4.
+        // arg3/arg4 are already neighbors, in the same order, both before and after the rebuild,
+        // and the author left a blank line between them -- that gap must survive untouched. Every
+        // other pair is newly adjacent because of the reorder and gets the tool's plain separator.
+        let source = "\
+class Standalone:
+    \"\"\"Standalone.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    arg3 : str
+        Arg3 doc.
+
+    arg4 : float
+        Arg4 doc.
+    arg2 : bool
+        Arg2 doc.
+    \"\"\"
+
+    def __init__(self, arg1, arg2, arg3, arg4):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+
+        let expected = "\
+class Standalone:
+    \"\"\"Standalone.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    arg2 : bool
+        Arg2 doc.
+    arg3 : str
+        Arg3 doc.
+
+    arg4 : float
+        Arg4 doc.
+    \"\"\"
+
+    def __init__(self, arg1, arg2, arg3, arg4):
+        pass
+";
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn a_parameters_section_with_a_duplicate_documented_name_does_not_panic_and_is_left_untouched() {
+        // Real-world regression (found against SimPEG source): a docstring section header the
+        // parser doesn't recognize (only the plural "Examples" is canonical numpydoc, not
+        // "Example") leaves everything after it parsed as bogus entries within the *previous*
+        // section's body. If two of those bogus entries collide on the same literal name (e.g.
+        // two `.. code-block:: python` directives), the second occurrence overwrites the first
+        // one's *range* in the parsed map without moving its *position* -- breaking the
+        // "insertion order matches text order" invariant the whole-block rebuild depends on.
+        // This is a simplified repro of that same shape: `arg1` is documented twice, so its
+        // entry ends up pointing at the SECOND (later) occurrence while still sitting at the
+        // FIRST occurrence's position, ahead of `arg2` (whose own range is still the earlier,
+        // in-between text). The rebuild must detect this and bail out rather than panic or
+        // splice a corrupted block.
+        let source = "\
+class Standalone:
+    \"\"\"Standalone.
+
+    Parameters
+    ----------
+    arg1 : int
+        First occurrence, stale text that would normally trigger a resync.
+    arg2 : str
+        Between the two arg1 occurrences.
+    arg1 : bool
+        Second occurrence of arg1, overwrites the first in the parsed map.
+    \"\"\"
+
+    def __init__(self, arg1, arg2):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        let _ = diagnostics;
+        // Left completely untouched -- no panic, no corrupted splice.
+        assert_eq!(output, source);
+    }
+
+    #[test]
+    fn splicing_across_a_crlf_file_does_not_introduce_a_spurious_blank_line() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Fresh text from Parent.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should sync.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+"
+        .replace('\n', "\r\n");
+
+        let (output, diagnostics) = sync(&source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child_section = &output[output.find("class Child").unwrap()..];
+        assert!(child_section.contains("arg1 : int\r\n        Fresh text from Parent."));
+        assert!(!child_section.contains("arg1 : int\r\n\r\n        Fresh text from Parent."));
+        assert!(!child_section.contains("arg1 : int\n        Fresh text from Parent."));
+    }
+
+    #[test]
+    fn reordering_a_crlf_file_uses_crlf_for_the_newly_synthesized_separator_too() {
+        // Same reordering shape as `parameters_are_reordered_to_match_the_signature...`, but on
+        // a CRLF file: arg1/arg2 are newly adjacent (no original gap to reuse), so the rebuild
+        // must synthesize its own separator for that pair -- and it must match the rest of the
+        // file's line endings, not silently downgrade to a bare `\n`.
+        let source = "\
+class Standalone:
+    \"\"\"Standalone.
+
+    Parameters
+    ----------
+    arg2 : bool
+        Arg2 doc.
+    arg1 : int
+        Arg1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, arg2):
+        pass
+"
+        .replace('\n', "\r\n");
+
+        let (output, diagnostics) = sync(&source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert!(
+            output.contains("arg1 : int\r\n        Arg1 doc.\r\n    arg2 : bool\r\n        Arg2 doc."),
+            "expected CRLF throughout the rebuilt block, got:\n{output}"
+        );
+        assert!(!output.contains("Arg1 doc.\n    arg2"), "found a bare LF separator in a CRLF file:\n{output}");
+    }
+
+    #[test]
+    fn ancestor_regenerated_entry_in_a_crlf_file_uses_crlf_between_its_own_name_and_description() {
+        // Real-world regression (found against SimPEG's `RawVec_e(BaseFDEMSrc)`): the entry
+        // that's actually changing (`integrate`, regenerated from the ancestor's text) sits at
+        // the END of an otherwise-unchanged, already-correctly-ordered block, so no reordering
+        // or gap-preservation logic is even in play here -- this is purely about
+        // `DocStyle::format_entry` itself, which used to hardcode a bare `\n` between the
+        // `name : type` line it builds and the description it appends, regardless of what line
+        // ending the rest of the (CRLF) file actually used.
+        let source = "\
+class BaseEMSrc:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    integrate : bool
+        If ``True``, we integrate the source term
+    \"\"\"
+
+    def __init__(self, integrate=False, **kwargs):
+        pass
+
+
+class RawVec_e(BaseEMSrc):
+    \"\"\"User-provided electric source term (s_e) class.
+
+    Parameters
+    ----------
+    receiver_list : list of simpeg.survey.BaseRx objects
+        Sets the receivers associated with the source
+    frequency : float
+        Source frequency
+    s_e: numpy.ndarray
+        Electric source term
+    integrate : bool, default: ``False``
+        If ``True``, integrate the source term; i.e. multiply by Me matrix
+    \"\"\"
+
+    def __init__(self, receiver_list, frequency, s_e, **kwargs):
+        pass
+"
+        .replace('\n', "\r\n");
+        let (output, diagnostics) = sync(&source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child_section = &output[output.find("class RawVec_e").unwrap()..];
+        assert!(
+            child_section.contains("integrate : bool\r\n        If ``True``, we integrate the source term"),
+            "expected CRLF between the regenerated name:type line and its description, got:\n{output}"
+        );
+        assert!(
+            !child_section.contains("integrate : bool\n        If ``True``, we integrate the source term"),
+            "found a bare LF separator in a CRLF file:\n{output}"
+        );
+    }
+
+    #[test]
+    fn a_raw_docstring_with_backslashes_only_in_prose_still_syncs_its_parameters_section() {
+        // Real-world regression (found against SimPEG's `MagDipole`): a `r"""..."""` docstring
+        // whose class-level prose is full of LaTeX (`\alpha`, `\mathbf{...}`, etc.) used to make
+        // the ENTIRE docstring untouchable, because the old check was "does this docstring
+        // contain a `\` anywhere" -- even though the Parameters section itself, and every entry
+        // in it, is plain ASCII with no backslash at all. Docerator never decodes escapes (always
+        // splices raw source bytes), so prose elsewhere in the same docstring was never actually
+        // a hazard; only copying backslash-bearing text *across* a raw/non-raw boundary is.
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Fresh text from Parent.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Child(Parent):
+    r\"\"\"Child with LaTeX math elsewhere in the docstring.
+
+    Uses :math:`\\alpha` and other backslash-heavy notation here, well before
+    the Parameters section -- none of this involves any parameter's own text.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should still resync.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child_section = &output[output.find("class Child").unwrap()..];
+        assert!(child_section.contains("arg1 : int\n        Fresh text from Parent."));
+    }
+
+    #[test]
+    fn copying_a_backslash_between_docstrings_of_the_same_raw_ness_is_allowed() {
+        // Both raw -- the same bytes mean the same thing in both literals, so there's nothing to
+        // guard against even though the copied text contains a backslash.
+        let source = "\
+class Parent:
+    r\"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Uses \\alpha in its description.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Child(Parent):
+    r\"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should resync.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child_section = &output[output.find("class Child").unwrap()..];
+        assert!(child_section.contains("arg1 : int\n        Uses \\alpha in its description."));
+    }
+
+    #[test]
+    fn copying_a_backslash_across_a_raw_ness_mismatch_is_refused_with_a_diagnostic() {
+        // Parent is raw (`\alpha` stays a literal backslash-a), Child is NOT raw (`\a` would be
+        // interpreted as the bell-character escape at runtime) -- copying this text verbatim
+        // would silently change what `Child.__init__.__doc__` actually contains. The entry must
+        // be left exactly as authored, with a diagnostic explaining why it wasn't touched.
+        let source = "\
+class Parent:
+    r\"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Uses \\alpha in its description.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should NOT resync -- raw-ness mismatch makes it unsafe.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert_eq!(output, source, "unsafe cross-raw-ness copy must leave the docstring untouched");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "DOC008");
+    }
+
+    const PARENT_WITH_ARG1_PY: &str = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+
+    #[test]
+    fn doc010_still_only_diagnoses_by_default_when_the_option_is_off() {
+        let source = format!(
+            "{PARENT_WITH_ARG1_PY}\n\nclass Child(Parent):\n    \"\"\"Child class.\n\n    Does some child-specific things.\n    \"\"\"\n\n    def __init__(self, arg1):\n        pass\n"
+        );
+        let (output, diagnostics) = sync(&source);
+        assert_eq!(output, source, "opt-in off must leave the docstring untouched, same as before this feature");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "DOC010");
+    }
+
+    #[test]
+    fn insert_missing_sections_synthesizes_a_parameters_section_when_none_exists_at_all() {
+        let source = format!(
+            "{PARENT_WITH_ARG1_PY}\n\nclass Child(Parent):\n    \"\"\"Child class.\n\n    Does some child-specific things.\n    \"\"\"\n\n    def __init__(self, arg1):\n        pass\n"
+        );
+        let (output, diagnostics) = sync_inserting_missing_sections(&source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child_section = &output[output.find("class Child").unwrap()..];
+        let expected = "\
+class Child(Parent):
+    \"\"\"Child class.
+
+    Does some child-specific things.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        assert_eq!(child_section, expected);
+    }
+
+    #[test]
+    fn insert_missing_sections_inserts_ahead_of_an_existing_later_section_in_canonical_order() {
+        let source = format!(
+            "{PARENT_WITH_ARG1_PY}\n\nclass Child(Parent):\n    \"\"\"Child class.\n\n    Returns\n    -------\n    None\n        Nothing.\n    \"\"\"\n\n    def __init__(self, arg1):\n        pass\n"
+        );
+        let (output, diagnostics) = sync_inserting_missing_sections(&source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child_section = &output[output.find("class Child").unwrap()..];
+        let expected = "\
+class Child(Parent):
+    \"\"\"Child class.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+
+    Returns
+    -------
+    None
+        Nothing.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        assert_eq!(child_section, expected);
+    }
+
+    #[test]
+    fn insert_missing_sections_never_creates_a_duplicate_header_over_a_malformed_existing_one() {
+        // The Parameters header IS present here, just malformed (misindented arg line, so it
+        // parses zero entries and fires DOC005) -- inserting a second header on top would either
+        // duplicate it outright or splice against bookkeeping already known to be untrustworthy.
+        let source = format!(
+            "{PARENT_WITH_ARG1_PY}\n\nclass Child(Parent):\n    \"\"\"Child class.\n\n    Parameters\n    ----------\n     bad_indent_entry\n    \"\"\"\n\n    def __init__(self, arg1):\n        pass\n"
+        );
+        let (output, diagnostics) = sync_inserting_missing_sections(&source);
+        assert_eq!(output, source, "a malformed existing header must never be touched, even with the option on");
+        let codes: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
+        assert!(codes.contains(&"DOC005"), "expected DOC005 for the malformed header, got: {diagnostics:?}");
+        assert!(codes.contains(&"DOC010"), "expected DOC010 for the still-undocumented arg1, got: {diagnostics:?}");
+    }
+
+    #[test]
+    fn insert_missing_sections_leaves_a_single_line_docstring_alone_and_still_diagnoses() {
+        // No multi-line content anywhere to measure indentation from -- inserting at column 0
+        // would produce a visibly misindented section, so this falls back to diagnosing DOC010
+        // exactly like the option-off case, rather than guessing wrong.
+        let source = format!("{PARENT_WITH_ARG1_PY}\n\nclass Child(Parent):\n    \"\"\"Child class.\"\"\"\n\n    def __init__(self, arg1):\n        pass\n");
+        let (output, diagnostics) = sync_inserting_missing_sections(&source);
+        assert_eq!(output, source);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "DOC010");
+    }
+
+    #[test]
+    fn insert_missing_sections_is_idempotent_on_rerun() {
+        let source = format!(
+            "{PARENT_WITH_ARG1_PY}\n\nclass Child(Parent):\n    \"\"\"Child class.\n\n    Does some child-specific things.\n    \"\"\"\n\n    def __init__(self, arg1):\n        pass\n"
+        );
+        let (first_pass, diagnostics) = sync_inserting_missing_sections(&source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let (second_pass, diagnostics) = sync_inserting_missing_sections(&first_pass);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert_eq!(first_pass, second_pass, "a second run must not change anything further");
     }
 }

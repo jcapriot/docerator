@@ -2,6 +2,7 @@
 //! lowest-priority layer in the resolution order (entity directive > file directive > this >
 //! hardcoded `numpydoc`; see `docerator_core::sync`).
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -20,6 +21,16 @@ struct ToolTable {
 #[derive(Debug, Default, Deserialize)]
 pub struct DoceratorConfig {
     pub style: Option<String>,
+    /// `[tool.docerator.rules]` — diagnostic code -> level (`"off"`, `"info"`, `"warning"`, or
+    /// `"error"`), e.g. `DOC001 = "error"`. Kept as raw strings here and parsed/validated in
+    /// `rules::merge` rather than as `RuleLevel` directly, so a typo in one entry only warns and
+    /// drops that entry instead of failing this whole file's config load.
+    #[serde(default)]
+    pub rules: HashMap<String, String>,
+    /// Mirrors `docerator_core::sync::SyncOptions::insert_missing_sections` — `--insert-missing-
+    /// sections` on the CLI overrides this when both are given (the CLI flag wins, same
+    /// precedent as every other layered setting here).
+    pub insert_missing_sections: Option<bool>,
 }
 
 /// Look for `pyproject.toml` directly inside `project_root` and read its `[tool.docerator]`

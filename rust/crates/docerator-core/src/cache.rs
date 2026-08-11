@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 
 use crate::style::{Diagnostic, ParamEntry, Severity};
 
-pub const CACHE_FORMAT_VERSION: u32 = 1;
+pub const CACHE_FORMAT_VERSION: u32 = 2;
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub type MethodViews = IndexMap<String, IndexMap<String, ParamEntry>>;
@@ -88,6 +88,11 @@ pub struct CachedParamEntry {
     pub description: Option<String>,
     pub range_start: u32,
     pub range_end: u32,
+    /// `CACHE_FORMAT_VERSION` was bumped alongside adding this field, so a cache written before
+    /// it existed is always rejected wholesale by `Cache::is_stale` before this default could
+    /// ever matter -- `#[serde(default)]` here is just defensive, not load-bearing.
+    #[serde(default)]
+    pub is_raw: bool,
 }
 
 pub fn hash_text(text: &str) -> String {
@@ -96,12 +101,13 @@ pub fn hash_text(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn compute_global_key(project_default_style: Option<&str>, module_names: &[String]) -> String {
+pub fn compute_global_key(project_default_style: Option<&str>, insert_missing_sections: bool, module_names: &[String]) -> String {
     let mut sorted: Vec<&str> = module_names.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     let mut hasher = Sha256::new();
     hasher.update(project_default_style.unwrap_or("").as_bytes());
     hasher.update([0u8]);
+    hasher.update([insert_missing_sections as u8]);
     for name in sorted {
         hasher.update(name.as_bytes());
         hasher.update([0u8]);
@@ -131,25 +137,13 @@ fn cached_to_severity(severity: CachedSeverity) -> Severity {
 
 /// `Diagnostic::code` is `&'static str` (every real diagnostic constructs it from a literal);
 /// recovering a `'static` reference after deserializing an owned `String` means mapping back
-/// through the known set rather than leaking memory — this is the one place that list needs to
-/// be kept in sync with the codes actually used elsewhere (a mismatch just means the diagnostic
-/// prints as `DOC000` instead of its real code, never a crash).
+/// through `KNOWN_DIAGNOSTIC_CODES` rather than leaking memory — a code that's since been removed
+/// (or was never real) just prints as `DOC000` instead of its real code, never a crash.
 fn static_code(code: &str) -> &'static str {
-    match code {
-        "DOC001" => "DOC001",
-        "DOC002" => "DOC002",
-        "DOC003" => "DOC003",
-        "DOC004" => "DOC004",
-        "DOC005" => "DOC005",
-        "DOC006" => "DOC006",
-        "DOC007" => "DOC007",
-        "DOC008" => "DOC008",
-        "DOC009" => "DOC009",
-        "DOC010" => "DOC010",
-        "DOC011" => "DOC011",
-        "DOC012" => "DOC012",
-        _ => "DOC000",
-    }
+    crate::style::KNOWN_DIAGNOSTIC_CODES
+        .iter()
+        .find_map(|&(known, _)| (known == code).then_some(known))
+        .unwrap_or("DOC000")
 }
 
 pub fn diagnostic_to_cached(diagnostic: &Diagnostic) -> CachedDiagnostic {
@@ -178,6 +172,7 @@ pub fn param_entry_to_cached(entry: &ParamEntry) -> CachedParamEntry {
         description: entry.description.clone(),
         range_start: entry.range.start().into(),
         range_end: entry.range.end().into(),
+        is_raw: entry.is_raw,
     }
 }
 
@@ -187,6 +182,7 @@ pub fn cached_to_param_entry(cached: &CachedParamEntry) -> ParamEntry {
         type_description: cached.type_description.clone(),
         description: cached.description.clone(),
         range: TextRange::new(TextSize::from(cached.range_start), TextSize::from(cached.range_end)),
+        is_raw: cached.is_raw,
     }
 }
 
@@ -224,18 +220,25 @@ mod tests {
 
     #[test]
     fn global_key_ignores_module_order() {
-        let a = compute_global_key(Some("numpydoc"), &["pkg.a".to_string(), "pkg.b".to_string()]);
-        let b = compute_global_key(Some("numpydoc"), &["pkg.b".to_string(), "pkg.a".to_string()]);
+        let a = compute_global_key(Some("numpydoc"), false, &["pkg.a".to_string(), "pkg.b".to_string()]);
+        let b = compute_global_key(Some("numpydoc"), false, &["pkg.b".to_string(), "pkg.a".to_string()]);
         assert_eq!(a, b);
     }
 
     #[test]
     fn global_key_is_sensitive_to_style_and_module_set() {
-        let base = compute_global_key(Some("numpydoc"), &["pkg.a".to_string()]);
-        let different_style = compute_global_key(Some("google"), &["pkg.a".to_string()]);
-        let different_modules = compute_global_key(Some("numpydoc"), &["pkg.a".to_string(), "pkg.b".to_string()]);
+        let base = compute_global_key(Some("numpydoc"), false, &["pkg.a".to_string()]);
+        let different_style = compute_global_key(Some("google"), false, &["pkg.a".to_string()]);
+        let different_modules = compute_global_key(Some("numpydoc"), false, &["pkg.a".to_string(), "pkg.b".to_string()]);
         assert_ne!(base, different_style);
         assert_ne!(base, different_modules);
+    }
+
+    #[test]
+    fn global_key_is_sensitive_to_insert_missing_sections() {
+        let off = compute_global_key(Some("numpydoc"), false, &["pkg.a".to_string()]);
+        let on = compute_global_key(Some("numpydoc"), true, &["pkg.a".to_string()]);
+        assert_ne!(off, on);
     }
 
     #[test]
@@ -269,6 +272,7 @@ mod tests {
             type_description: Some("int".to_string()),
             description: Some("desc".to_string()),
             range: TextRange::new(TextSize::from(0), TextSize::from(10)),
+            is_raw: true,
         };
         let cached = param_entry_to_cached(&original);
         let restored = cached_to_param_entry(&cached);

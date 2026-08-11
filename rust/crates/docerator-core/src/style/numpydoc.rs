@@ -45,7 +45,7 @@ impl DocStyle for NumpydocStyle {
         parse_entries(docstring_text)
     }
 
-    fn format_entry(&self, entry: &ParamEntry, _indent: &str) -> String {
+    fn format_entry(&self, entry: &ParamEntry, _indent: &str, newline: &str) -> String {
         // `description` is captured verbatim from wherever it was copied from, including its
         // own leading whitespace on continuation lines — correct as-is when source and target
         // share indentation context, which is true for every M2 fixture (same file, same
@@ -58,7 +58,7 @@ impl DocStyle for NumpydocStyle {
             out.push_str(ty);
         }
         if let Some(desc) = &entry.description {
-            out.push('\n');
+            out.push_str(newline);
             out.push_str(desc);
         }
         out
@@ -120,6 +120,23 @@ fn make_line(text: &str, start: usize, mut end: usize) -> Line {
     Line { start, end }
 }
 
+/// The start of the physical line right after the one ending at `line_end`. `Line::end` always
+/// excludes a trailing `\r` from its own content (so a CRLF-terminated line's indent/content
+/// computations stay clean) — which means `line_end` sits *on* the `\r` for a CRLF line, one
+/// byte short of `line_end + 1` actually reaching the next line's real start. Scanning forward
+/// for the actual `\n` byte and stepping past it is correct for both `\n`- and `\r\n`-terminated
+/// input without needing to track which one applied. Getting this wrong doesn't move any entry's
+/// byte *range* (its end is independently derived and self-corrects via `trim_end`), but it does
+/// corrupt the captured description *text* — the line's own `\n` reappears as a spurious leading
+/// blank line, which then gets faithfully reproduced (per the "preserve authored formatting"
+/// rule) everywhere that description is auto-synced.
+fn next_line_start(source: &str, line_end: usize) -> usize {
+    match source.as_bytes()[line_end..].iter().position(|&b| b == b'\n') {
+        Some(offset) => line_end + offset + 1,
+        None => line_end,
+    }
+}
+
 /// The indentation shared by every line after the first (the summary line is exempt, matching
 /// `inspect.cleandoc`'s treatment of it) — the "logical column 0" that section headers and
 /// arg-name lines must sit at. Blank lines never count toward the minimum.
@@ -140,6 +157,11 @@ fn compute_margin(lines: &[Line], source: &str) -> usize {
 
 struct SectionBody {
     canon_index: usize,
+    /// Byte offset of the start of this section's own header line (`<Name>`, not its
+    /// underline) — used to anchor an insertion *before* this section when synthesizing a
+    /// section that canonically belongs earlier (e.g. inserting a missing `Parameters` section
+    /// ahead of an existing `Returns` one).
+    header_start: usize,
     body_start: usize,
     body_end: usize,
 }
@@ -221,6 +243,7 @@ fn find_sections(lines: &[Line], source: &str, margin: usize, diagnostics: &mut 
         };
         sections.push(SectionBody {
             canon_index,
+            header_start: lines[header_idx].start,
             body_start,
             body_end,
         });
@@ -284,19 +307,27 @@ fn parse_section(lines: &[Line], source: &str, section: &SectionBody, margin: us
         }
         let (raw_names, type_desc) = split_name_type(content);
 
-        let desc_start = line.end + 1;
+        let desc_start = next_line_start(source, line.end);
         let raw_desc_end = match arg_line_indices.get(pos + 1) {
             Some(&next_idx) => lines[next_idx].start.saturating_sub(1).min(section.body_end),
             None => section.body_end,
         };
-        // Trim trailing whitespace: an entry that's the last one in its section, immediately
-        // followed by another section, otherwise picks up one incidental trailing newline from
-        // the blank-line gap before that next section's header (the same slicing rule that
-        // correctly excludes the header itself leaves this one artifact behind). That's not
-        // real content — left untrimmed it makes two structurally-identical entries compare
-        // unequal across classes, and if an edit *is* needed, splicing over it eats the
-        // blank-line separator along with it. Interior blank lines (a genuine multi-paragraph
-        // description) are untouched since trimming only ever shortens from the end.
+
+        // Trim only trailing whitespace, never leading: an author-written blank line between
+        // the `name : type` line and the description is part of that entry's own authored
+        // formatting and must be preserved verbatim so it's reproduced faithfully wherever this
+        // entry gets auto-synced — it is NOT the tool's place to normalize an author's spacing
+        // choice within their own content. Trailing whitespace is different: it's never really
+        // "this entry's content" at all, it's the gap before whatever comes next (another
+        // parameter, or — for the last entry in a section immediately followed by another
+        // section — the next section's header, picked up as one incidental trailing newline by
+        // the same slicing rule that correctly excludes the header text itself). Stopping the
+        // range at the end of the last real content line, however many blank lines follow,
+        // means splicing never reaches into that trailing gap at all — so whatever spacing
+        // already exists at the splice *target* (zero blank lines or several) is left
+        // completely untouched, never stripped and never padded, matching "keep what's there,
+        // insert nothing of your own." Interior blank lines (a genuine multi-paragraph
+        // description) are untouched either way since trimming only ever shortens from one end.
         let (description, desc_end) = if desc_start < raw_desc_end {
             let trimmed = source[desc_start..raw_desc_end].trim_end();
             if trimmed.is_empty() {
@@ -324,6 +355,9 @@ fn parse_section(lines: &[Line], source: &str, section: &SectionBody, margin: us
                     type_description: type_desc.map(str::to_string),
                     description: description.clone(),
                     range: entry_range,
+                    // Stamped in by the caller via `ParsedEntries::set_is_raw` once the source
+                    // docstring's raw-ness is known -- parsing itself is style-agnostic.
+                    is_raw: false,
                 },
             );
         }
@@ -363,7 +397,21 @@ fn parse_entries(source: &str) -> (ParsedEntries, Vec<Diagnostic>) {
         }
     }
 
-    (ParsedEntries { primary, secondary }, diagnostics)
+    (
+        ParsedEntries {
+            primary,
+            secondary,
+            has_primary_section: params_section.is_some(),
+            // `sections` is built by `find_sections` scanning top-to-bottom, and a section is
+            // only ever accepted (pushed) when its canon_index exceeds every previously accepted
+            // one — an out-of-order header is rejected (DOC003), never accepted out of position
+            // — so acceptance order and text order coincide: the first element, if any, really
+            // is the textually-first recognized section, regardless of its own kind.
+            first_section_start: sections.first().map(|s| s.header_start),
+            margin_indent: " ".repeat(margin),
+        },
+        diagnostics,
+    )
 }
 
 #[cfg(test)]
@@ -485,6 +533,53 @@ mod tests {
     }
 
     #[test]
+    fn leading_blank_line_before_description_is_preserved_verbatim() {
+        let doc = "Summary\n\nParameters\n----------\narg1 : int\n\n    Description with a blank line above it.\n";
+        let (parsed, diagnostics) = parse_entries(doc);
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            parsed.get("arg1").unwrap().description.as_deref(),
+            Some("\n    Description with a blank line above it.")
+        );
+    }
+
+    #[test]
+    fn multiple_leading_blank_lines_before_description_are_all_preserved() {
+        let doc = "Summary\n\nParameters\n----------\narg1 : int\n\n\n    Description after two blank lines.\n";
+        let (parsed, diagnostics) = parse_entries(doc);
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            parsed.get("arg1").unwrap().description.as_deref(),
+            Some("\n\n    Description after two blank lines.")
+        );
+    }
+
+    #[test]
+    fn arg_with_no_description_at_all_does_not_panic() {
+        let doc = "Summary\n\nParameters\n----------\narg1 : int\narg2 : str\n    Has a description.\n";
+        let (parsed, diagnostics) = parse_entries(doc);
+        assert!(diagnostics.is_empty());
+        assert_eq!(parsed.get("arg1").unwrap().description, None);
+        assert_eq!(parsed.get("arg2").unwrap().description.as_deref(), Some("    Has a description."));
+    }
+
+    #[test]
+    fn crlf_line_endings_do_not_produce_a_spurious_leading_blank_line() {
+        // Regression test: `desc_start` used to be computed as `line.end + 1`, which is only
+        // correct for `\n`-terminated input. For `\r\n` lines, `Line::end` sits *on* the `\r`
+        // (it's excluded from the line's own content), so `+ 1` landed on the `\n` itself
+        // instead of past it -- the arg-name line's own newline then reappeared as a spurious
+        // leading `\n` in the captured description, silently invisible on disk (nothing ever
+        // spliced it) until the entry was auto-synced somewhere else, at which point the
+        // erroneous leading newline became a real, visible blank line in the regenerated text.
+        let lf = "Summary\n\nParameters\n----------\narg1 : int\n    Clean description.\n";
+        let crlf = lf.replace('\n', "\r\n");
+        let (parsed, diagnostics) = parse_entries(&crlf);
+        assert!(diagnostics.is_empty());
+        assert_eq!(parsed.get("arg1").unwrap().description.as_deref(), Some("    Clean description."));
+    }
+
+    #[test]
     fn section_with_no_parameters_section_present_is_empty() {
         let doc = "Summary\nInformation about this class\n\nReturns\n-------\nnothing : None\n    This doesn't return anything, but this description looks like an arg type.\n";
         let (parsed, diagnostics) = parse_entries(doc);
@@ -518,5 +613,41 @@ mod tests {
         assert_eq!(body_text("Examples"), Some("item"));
         assert_eq!(body_text("Methods"), None);
         assert_eq!(body_text("Returns"), None);
+    }
+
+    #[test]
+    fn no_sections_at_all_reports_no_primary_section_and_no_first_section_start() {
+        let doc = "Just a summary line, no sections at all.\n";
+        let (parsed, _diagnostics) = parse_entries(doc);
+        assert!(!parsed.has_primary_section);
+        assert_eq!(parsed.first_section_start, None);
+    }
+
+    #[test]
+    fn first_section_start_points_at_the_textually_first_section_regardless_of_kind() {
+        let doc = "Summary\n\nReturns\n-------\nnothing : None\n    Nothing.\n";
+        let (parsed, _diagnostics) = parse_entries(doc);
+        assert!(!parsed.has_primary_section);
+        let expected = doc.find("Returns").unwrap();
+        assert_eq!(parsed.first_section_start, Some(expected));
+    }
+
+    #[test]
+    fn has_primary_section_is_true_even_when_it_parsed_no_entries() {
+        // A present-but-empty Parameters header (DOC005) must be reported as "has a section" --
+        // never as "missing" -- so a caller deciding whether to synthesize one from scratch
+        // never ends up creating a duplicate header right on top of the malformed one.
+        let doc = "Summary\n\nParameters\n----------\n bad_indent\n";
+        let (parsed, diagnostics) = parse_entries(doc);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "DOC005");
+        assert!(parsed.has_primary_section);
+    }
+
+    #[test]
+    fn margin_indent_matches_the_shared_indentation_of_arg_and_section_lines() {
+        let doc = "Summary\n\n    Parameters\n    ----------\n    arg1 : int\n        Doc.\n";
+        let (parsed, _diagnostics) = parse_entries(doc);
+        assert_eq!(parsed.margin_indent, "    ");
     }
 }

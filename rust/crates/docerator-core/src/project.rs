@@ -210,17 +210,28 @@ pub fn resolve_base_ref(project: &ProjectModel, file: &ProjectFile, base_ref: &B
             }
             let (head, rest) = segments.split_first()?;
             let (class_name, module_segments) = rest.split_last()?;
-            match file.model.imports.get(head) {
-                Some(ImportedSymbol::Module(dotted)) => {
-                    let mut target_module = dotted.clone();
-                    for seg in module_segments {
-                        target_module.push('.');
-                        target_module.push_str(seg);
-                    }
-                    resolve_symbol(project, &target_module, class_name)
+            let target_module = match file.model.imports.get(head) {
+                Some(ImportedSymbol::Module(dotted)) => Some(dotted.clone()),
+                Some(ImportedSymbol::Name { module, name: target_name }) => {
+                    // `from pkg import name` binds `name` identically whether `name` is a
+                    // symbol defined in `pkg` or `name` is itself one of `pkg`'s submodules
+                    // (Python's import statement doesn't distinguish the two cases syntactically)
+                    // -- e.g. `from ... import survey` when `survey` is a real sibling module
+                    // (`survey.py`), then used as `survey.BaseRx`. Try that submodule
+                    // interpretation: if `{parent}.{name}` isn't actually a project module,
+                    // `resolve_symbol` below simply won't find anything there, exactly as if
+                    // this branch didn't fire at all.
+                    let parent = resolve_import_source(file, module)?;
+                    Some(format!("{parent}.{target_name}"))
                 }
-                _ => None,
+                None => None,
+            };
+            let mut target_module = target_module?;
+            for seg in module_segments {
+                target_module.push('.');
+                target_module.push_str(seg);
             }
+            resolve_symbol(project, &target_module, class_name)
         }
     }
 }

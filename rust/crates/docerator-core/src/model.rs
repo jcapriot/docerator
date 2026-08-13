@@ -53,6 +53,12 @@ pub enum ImportSource {
 pub struct DocstringInfo {
     /// Absolute (file-coordinate) byte range of the docstring's interior text, quotes excluded.
     pub inner_range: TextRange,
+    /// Absolute (file-coordinate) byte range of the *whole* string-literal statement, quotes
+    /// included — unlike `inner_range`, this reaches all the way to the closing `"""`/`'''`/`"`/
+    /// `'`. Anchors insertions that need to land right after the docstring itself (e.g. a
+    /// provenance comment), which `inner_range.end()` alone can't do since it stops short of the
+    /// closing quotes.
+    pub literal_range: TextRange,
     /// The interior text, verbatim (escapes not decoded).
     pub text: String,
     /// Whether the literal has an `r`/`R` prefix (`r"""..."""`). Since docerator always splices
@@ -91,6 +97,16 @@ pub struct ClassModel {
     pub directives: Directives,
     /// The `class` statement's own range — used to anchor diagnostics about its base classes.
     pub range: TextRange,
+    /// The class's own leading docstring, captured unconditionally — independent of whether this
+    /// class defines its own `__init__` at all. When it *does* define one, this is the same
+    /// docstring `methods["__init__"].docstring` already ends up with (via the existing "a
+    /// docstring-less `__init__` borrows the class's own docstring" rule); when it *doesn't*,
+    /// `methods` has no `"__init__"` entry to hang a docstring off of at all, so this is the only
+    /// place it's recorded. `sync.rs` uses it to synthesize a virtual `__init__` entry — borrowing
+    /// the signature of whichever ancestor actually defines the constructor this class inherits
+    /// unchanged — for a class that documents constructor parameters in its own class-level
+    /// docstring purely by numpydoc convention, without itself declaring `__init__` at all.
+    pub own_docstring: Option<DocstringInfo>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -243,6 +259,7 @@ fn build_class_model(source: &str, class_def: &StmtClassDef, diagnostics: &mut V
         methods,
         directives: class_directives,
         range: class_def.range(),
+        own_docstring: class_docstring,
     }
 }
 
@@ -297,9 +314,11 @@ fn leading_docstring(source: &str, body: &[Stmt]) -> Option<DocstringInfo> {
     let Expr::StringLiteral(string_lit) = expr_stmt.value.as_ref() else {
         return None;
     };
-    let (inner_range, text, is_raw) = docstring_inner(source, string_lit.range())?;
+    let literal_range = string_lit.range();
+    let (inner_range, text, is_raw) = docstring_inner(source, literal_range)?;
     Some(DocstringInfo {
         inner_range,
+        literal_range,
         text: text.to_string(),
         is_raw,
     })

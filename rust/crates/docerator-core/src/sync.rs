@@ -18,8 +18,9 @@ use crate::edit::{apply_edits, TextEdit};
 use crate::model::{self, ClassModel, MethodModel};
 use crate::parse;
 use crate::project::{self, ClassId, ProjectFile, ProjectModel};
+use crate::provenance::{self, ProvenanceEntry, ProvenanceMode, ReconcileOutcome};
 use crate::style::numpydoc::NumpydocStyle;
-use crate::style::{Diagnostic, DocStyle, ParamEntry, Severity};
+use crate::style::{Diagnostic, DocStyle, EntryOrigin, ParamEntry, Severity};
 
 pub struct FileOutput {
     pub path: PathBuf,
@@ -40,6 +41,20 @@ pub struct SyncOptions<'a> {
     /// opinionated, structural edit than this tool's usual "only ever resync what's already
     /// there" default, so it's opt-in.
     pub insert_missing_sections: bool,
+    /// Whether (and how) to make an auto-managed parameter's ancestor visible in the source: a
+    /// managed comment block after the docstring, a note inline in the copied text, or neither.
+    /// Defaults to `Comment` (via `ProvenanceMode`'s own `Default`) — unlike
+    /// `insert_missing_sections`, this is purely presentational (never changes what a docstring's
+    /// own content says, just adds a note about where it came from), so it's on by default.
+    pub provenance_mode: ProvenanceMode,
+    /// When several consecutive, auto-managed (inherited, non-overridden) parameters share
+    /// identical documentation (type, description, *and* origin), render them back out as one
+    /// combined `nameA, nameB : shared type` line — mirroring `numpydoc`'s own convention for
+    /// this, and how they were almost certainly documented in the ancestor to begin with —
+    /// instead of duplicating the identical text once per name. Off by default: like
+    /// `insert_missing_sections`, this restructures the shape of a `Parameters` section rather
+    /// than only ever resyncing content in place, so it's opt-in.
+    pub merge_shared_parameters: bool,
 }
 
 impl<'a> SyncOptions<'a> {
@@ -47,6 +62,8 @@ impl<'a> SyncOptions<'a> {
         Self {
             project_default_style,
             insert_missing_sections: false,
+            provenance_mode: ProvenanceMode::default(),
+            merge_shared_parameters: false,
         }
     }
 }
@@ -84,6 +101,12 @@ fn sync_project_inner(files: &[(PathBuf, String)], options: SyncOptions, old_cac
     let mut diagnostics_by_file: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
     let project = project::build_project(files, &mut diagnostics_by_file);
     let file_by_path: HashMap<PathBuf, &ProjectFile> = project.files.iter().map(|f| (f.path.clone(), f)).collect();
+    // Comment-mode provenance reconciliation needs to read the file's raw text *after* a
+    // docstring's own closing quotes -- `doc.text`/`inner_range` only ever cover the docstring's
+    // own interior, and `ProjectFile` doesn't retain the whole file's source once parsed. This is
+    // the one place `resolve_and_rewrite` needs it, so it's looked up by path rather than
+    // threading a full copy through the model.
+    let source_by_path: HashMap<&PathBuf, &str> = files.iter().map(|(p, t)| (p, t.as_str())).collect();
 
     let content_hash: HashMap<PathBuf, String> = files.iter().map(|(p, t)| (p.clone(), cache::hash_text(t))).collect();
     let module_hash: HashMap<String, String> = project
@@ -92,11 +115,19 @@ fn sync_project_inner(files: &[(PathBuf, String)], options: SyncOptions, old_cac
         .filter_map(|f| content_hash.get(&f.path).map(|h| (f.module_name.clone(), h.clone())))
         .collect();
     let module_names: Vec<String> = project.files.iter().map(|f| f.module_name.clone()).collect();
-    let global_key = cache::compute_global_key(options.project_default_style, options.insert_missing_sections, &module_names);
+    let global_key = cache::compute_global_key(
+        options.project_default_style,
+        options.insert_missing_sections,
+        options.provenance_mode,
+        options.merge_shared_parameters,
+        &module_names,
+    );
 
     let usable_old_cache = old_cache.filter(|c| !c.is_stale() && c.global_key == global_key);
 
     let mut memo: HashMap<ClassId, MethodViews> = HashMap::new();
+    let mut local_authored_memo: HashMap<ClassId, MethodViews> = HashMap::new();
+    let mut mro_memo: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
     let mut cache_valid_files: HashSet<PathBuf> = HashSet::new();
 
     if let Some(old) = usable_old_cache {
@@ -111,6 +142,13 @@ fn sync_project_inner(files: &[(PathBuf, String)], options: SyncOptions, old_cac
                         name: class_name.clone(),
                     };
                     memo.insert(id, cache::cached_to_method_views(cached_views));
+                }
+                for (class_name, cached_views) in &cached_file.local_authored {
+                    let id = ClassId {
+                        module: file.module_name.clone(),
+                        name: class_name.clone(),
+                    };
+                    local_authored_memo.insert(id, cache::cached_to_method_views(cached_views));
                 }
             }
         }
@@ -136,6 +174,11 @@ fn sync_project_inner(files: &[(PathBuf, String)], options: SyncOptions, old_cac
             id,
             options.project_default_style,
             options.insert_missing_sections,
+            options.provenance_mode,
+            options.merge_shared_parameters,
+            &source_by_path,
+            &mut mro_memo,
+            &mut local_authored_memo,
             &mut memo,
             &mut edits_by_file,
             &mut diagnostics_by_file,
@@ -185,6 +228,19 @@ fn sync_project_inner(files: &[(PathBuf, String)], options: SyncOptions, old_cac
                     (name.clone(), cache::method_views_to_cached(&views))
                 })
                 .collect();
+            let local_authored: HashMap<String, cache::CachedMethodViews> = file
+                .model
+                .classes
+                .keys()
+                .map(|name| {
+                    let id = ClassId {
+                        module: file.module_name.clone(),
+                        name: name.clone(),
+                    };
+                    let views = local_authored_memo.get(&id).cloned().unwrap_or_default();
+                    (name.clone(), cache::method_views_to_cached(&views))
+                })
+                .collect();
 
             new_cache_files.insert(
                 path.clone(),
@@ -194,6 +250,7 @@ fn sync_project_inner(files: &[(PathBuf, String)], options: SyncOptions, old_cac
                     output_text: output_text.clone(),
                     diagnostics: diagnostics.iter().map(cache::diagnostic_to_cached).collect(),
                     classes,
+                    local_authored,
                 },
             );
         }
@@ -244,11 +301,17 @@ pub fn sync_source_with_options(
 /// sees when it looks up this class as an ancestor.
 type MethodViews = IndexMap<String, IndexMap<String, ParamEntry>>;
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_and_rewrite(
     project: &ProjectModel,
     class_id: &ClassId,
     project_default_style: Option<&str>,
     insert_missing_sections: bool,
+    provenance_mode: ProvenanceMode,
+    merge_shared_parameters: bool,
+    source_by_path: &HashMap<&PathBuf, &str>,
+    mro_memo: &mut HashMap<ClassId, Vec<ClassId>>,
+    local_authored_memo: &mut HashMap<ClassId, MethodViews>,
     memo: &mut HashMap<ClassId, MethodViews>,
     edits_by_file: &mut HashMap<PathBuf, Vec<TextEdit>>,
     diagnostics_by_file: &mut HashMap<PathBuf, Vec<Diagnostic>>,
@@ -261,41 +324,60 @@ fn resolve_and_rewrite(
         return IndexMap::new();
     };
 
-    let mut ancestor_id: Option<ClassId> = None;
+    // Diagnose an unresolvable-but-imported *direct* base ref -- unchanged, still about the
+    // literal syntax on this class's own `class Foo(...):` line, independent of the transitive
+    // MRO computed below.
     for base_ref in &class.base_refs {
         let was_imported = base_ref_head_is_imported(file, base_ref);
-        match project::resolve_base_ref(project, file, base_ref) {
-            Some(resolved) if ancestor_id.is_none() => {
-                ancestor_id = Some(resolved);
-            }
-            Some(_) => {}
-            None if was_imported => {
-                diagnostics_by_file.entry(file.path.clone()).or_default().push(Diagnostic {
-                    code: "DOC002",
-                    severity: Severity::Info,
-                    message: "base class import could not be statically resolved within the project \
-                              (external/stdlib dependency, or genuinely not found) — treated as opaque"
-                        .to_string(),
-                    range: class.range,
-                });
-            }
-            None => {}
+        if project::resolve_base_ref(project, file, base_ref).is_none() && was_imported {
+            diagnostics_by_file.entry(file.path.clone()).or_default().push(Diagnostic {
+                code: "DOC002",
+                severity: Severity::Info,
+                message: "base class import could not be statically resolved within the project \
+                          (external/stdlib dependency, or genuinely not found) — treated as opaque"
+                    .to_string(),
+                range: class.range,
+            });
         }
     }
 
-    let parent_view: MethodViews = ancestor_id
-        .map(|id| {
-            resolve_and_rewrite(
-                project,
-                &id,
-                project_default_style,
-                insert_missing_sections,
-                memo,
-                edits_by_file,
-                diagnostics_by_file,
-            )
-        })
-        .unwrap_or_default();
+    // Real C3 linearization (matching Python's own MRO algorithm), not an approximation of it:
+    // walk this class's full transitive ancestor order (excluding itself) in *reverse* priority
+    // (least-specific ancestor first, most-specific last), overlaying each ancestor's own LOCAL
+    // contribution only -- never an already-flattened view. That distinction is what makes this
+    // correct for genuine multiple inheritance: an ancestor that merely *passes through* some
+    // parameter (never documents it itself) must never be able to shadow a more-specific class
+    // elsewhere in the MRO that actually redocuments it, which a naive "merge each direct base's
+    // own fully-resolved view" scheme (this function's own earlier implementation) gets wrong
+    // whenever a shared ancestor is reached through one branch that doesn't override some
+    // parameter and another branch that does -- see `compute_mro`'s own doc comment for the
+    // worked example and why it matters.
+    let mro = compute_mro(project, class_id, mro_memo, diagnostics_by_file);
+    let mut parent_view: MethodViews = IndexMap::new();
+    for ancestor_id in mro[1..].iter().rev() {
+        resolve_and_rewrite(
+            project,
+            ancestor_id,
+            project_default_style,
+            insert_missing_sections,
+            provenance_mode,
+            merge_shared_parameters,
+            source_by_path,
+            mro_memo,
+            local_authored_memo,
+            memo,
+            edits_by_file,
+            diagnostics_by_file,
+        );
+        if let Some(ancestor_local) = local_authored_memo.get(ancestor_id) {
+            for (method_name, params) in ancestor_local {
+                let target = parent_view.entry(method_name.clone()).or_default();
+                for (param_name, entry) in params {
+                    target.insert(param_name.clone(), entry.clone());
+                }
+            }
+        }
+    }
 
     let edits = edits_by_file.entry(file.path.clone()).or_default();
     let diagnostics = diagnostics_by_file.entry(file.path.clone()).or_default();
@@ -306,8 +388,57 @@ fn resolve_and_rewrite(
     // Without this, a non-overriding ancestor would silently erase every parameter documented
     // above it in the chain.
     let mut this_view: MethodViews = parent_view.clone();
+    // This class's own contribution only (never pass-through) -- what a descendant elsewhere in
+    // the MRO needs to correctly overlay on top of *its* inherited view, without also dragging
+    // along whatever this class merely forwards from its own ancestors (which would let a
+    // pass-through wrongly shadow a more-specific override reached via a different MRO branch).
+    let mut local_authored_for_this_class: MethodViews = IndexMap::new();
 
-    for (method_name, method) in &class.methods {
+    // A class that documents constructor parameters in its own class-level docstring, purely by
+    // numpydoc convention, without itself declaring `__init__` at all -- inheriting the real
+    // constructor unchanged from an ancestor -- is otherwise completely invisible to this whole
+    // engine: `class.methods` has no `"__init__"` entry to iterate below at all, so nothing ever
+    // parses, checks, or resyncs its docstring, silently, forever. Real-world SimPEG examples:
+    // `TimeFields(Fields)` and `Simulation3DElectricField(BaseFDEMSimulation)`, both `pass`-style
+    // (no `__init__` of their own) with a full `Parameters` section describing the inherited
+    // constructor anyway. Synthesize a virtual `__init__` for exactly this case: borrow the
+    // signature of the nearest ancestor (walking the real MRO, not just the direct base) that
+    // actually defines `__init__` locally -- that's the constructor Python really calls for this
+    // class, unchanged -- and process this class's own docstring against it, same as any other
+    // method. `directives: Directives::default()` is correct, not a placeholder: there's no `def
+    // __init__` line in the source to attach a directive comment above in the first place, so
+    // there's nothing to parse there -- `effective_overrides`/`effective_style_name`/etc. already
+    // fall back to the class's own directives for `__init__` specifically, which is exactly what
+    // should govern this synthesized entry too.
+    let methods: std::borrow::Cow<IndexMap<String, MethodModel>> = if class.methods.contains_key("__init__") {
+        std::borrow::Cow::Borrowed(&class.methods)
+    } else if let Some(docstring) = &class.own_docstring {
+        let borrowed_signature = mro[1..].iter().find_map(|ancestor_id| {
+            project
+                .class(ancestor_id)
+                .and_then(|(_, ancestor_class)| ancestor_class.methods.get("__init__"))
+                .map(|m| m.signature.clone())
+        });
+        match borrowed_signature {
+            Some(signature) => {
+                let mut augmented = class.methods.clone();
+                augmented.insert(
+                    "__init__".to_string(),
+                    MethodModel {
+                        docstring: Some(docstring.clone()),
+                        signature,
+                        directives: crate::directives::Directives::default(),
+                    },
+                );
+                std::borrow::Cow::Owned(augmented)
+            }
+            None => std::borrow::Cow::Borrowed(&class.methods),
+        }
+    } else {
+        std::borrow::Cow::Borrowed(&class.methods)
+    };
+
+    for (method_name, method) in methods.iter() {
         let inherited_from_ancestors = parent_view.get(method_name).cloned().unwrap_or_default();
         let effective_skip = class.directives.skip || method.directives.skip;
         let effective_overrides = effective_overrides(class, method_name, method);
@@ -327,6 +458,16 @@ fn resolve_and_rewrite(
                 // right where that copying actually happens (`format_entry` call sites below),
                 // not by refusing to touch an entire docstring for containing a `\` anywhere.
                 parsed_entries.set_is_raw(doc.is_raw);
+                // Every entry parsed here is, as of this moment, "authored in this class" as
+                // far as provenance is concerned -- if it turns out to be pure pass-through
+                // inheritance instead (not added to `authored` below), it never overwrites
+                // `this_view`'s existing copy, so a deeper ancestor's own stamp survives
+                // untouched. That's what lets a stamp made once here answer "who really first
+                // authored this" correctly at any depth, with no extra bookkeeping.
+                parsed_entries.set_origin(EntryOrigin {
+                    module: class_id.module.clone(),
+                    class_name: class_id.name.clone(),
+                });
 
                 if effective_skip {
                     // Exempt: no edits, no diagnostics about this entity's own structure — but
@@ -335,6 +476,14 @@ fn resolve_and_rewrite(
                         authored.insert(name.clone(), entry.clone());
                     }
                 } else {
+                    // Accumulated across every render site below (the primary/secondary rebuild,
+                    // `insert_missing_sections`'s synthesis, and `expand_kwargs`) and reconciled
+                    // into a comment block once, after all of them, at the very end of this
+                    // method's processing -- recorded whenever a copied entry is actually used
+                    // for splicing, *including* the already-in-sync case, so the block stays
+                    // correct on every run, not only ones that also produce a text edit.
+                    let mut provenance_entries: Vec<ProvenanceEntry> = Vec::new();
+
                     for d in parse_diagnostics {
                         diagnostics.push(offset_diagnostic(d, doc.inner_range.start()));
                     }
@@ -405,8 +554,26 @@ fn resolve_and_rewrite(
                     // stray/legacy entry) keeps its original relative order, appended after
                     // every signature-ordered entry -- there's no signature position for it to
                     // match, so "leave it where it already reads naturally" is the only sane
-                    // default.
+                    // default. EXCEPT a name that's currently `expand_kwargs`-eligible (inherited,
+                    // not overridden, not excluded) while the *active* target is `Other
+                    // Parameters` -- that name belongs in the other section now, not here, most
+                    // commonly because the `expand_kwargs=` directive's value just changed since
+                    // the last run. Leaving it out of `ordered_names` (and therefore out of the
+                    // rebuilt `pieces` below) is what actually removes it from this block: the
+                    // whole-block rebuild still replaces `block_range` (computed from every entry
+                    // literally on disk, this one included) with freshly built content that no
+                    // longer mentions it -- no separate delete edit needed for this direction.
+                    // `expand_kwargs` itself is responsible for the *other* direction (a stale
+                    // entry left behind in `Other Parameters` when the target switches away from
+                    // it), since nothing else ever manages that section.
                     for name in parsed_entries.primary.keys() {
+                        if effective_expand_target == Some(crate::style::ParamSectionKind::Secondary)
+                            && inherited_from_ancestors.contains_key(name)
+                            && !effective_overrides.contains(name)
+                            && !effective_exclude.contains(name)
+                        {
+                            continue;
+                        }
                         if !ordered_names.iter().any(|n| n == name) {
                             ordered_names.push(name.clone());
                         }
@@ -415,29 +582,93 @@ fn resolve_and_rewrite(
                     match primary_block_span(&parsed_entries.primary, &doc.text) {
                         Some((block_range, indent)) => {
                             let newline = newline_style(&doc.text);
-                            let pieces: Vec<String> = ordered_names
-                                .iter()
-                                .map(|name| {
-                                    if !effective_overrides.contains(name) {
-                                        if let Some(ancestor_entry) = inherited_from_ancestors.get(name) {
-                                            let candidate = style.format_entry(ancestor_entry, "", newline);
-                                            if safe_to_copy_across_raw_ness(ancestor_entry.is_raw, doc.is_raw, &candidate) {
-                                                return candidate;
+                            // `merge_shared_parameters` collapses a run of consecutive,
+                            // auto-managed names sharing identical documentation into one group,
+                            // rendered as a single `nameA, nameB : shared type` line below --
+                            // every other name is its own singleton group, so this is a no-op
+                            // shape-wise when the option is off.
+                            let groups =
+                                group_names_for_rendering(&ordered_names, &effective_overrides, &inherited_from_ancestors, merge_shared_parameters);
+                            let mut pieces: Vec<String> = Vec::with_capacity(groups.len());
+                            // Parallel to `pieces`, not `ordered_names`/`groups` -- a comma-group
+                            // entry (`nameA, nameB : shared type`, on-disk or newly merged) can
+                            // make those list more names than `pieces` ends up with actual rows
+                            // for, so the join loop needs its own aligned name list to look up
+                            // gaps against.
+                            let mut piece_names: Vec<&String> = Vec::with_capacity(groups.len());
+                            // The most recent *authored* (verbatim on-disk) entry's own range, so
+                            // a `numpydoc` `nameA, nameB : shared type` comma-group -- which
+                            // `parse_section` gives every one of its names the identical `range`
+                            // -- only ever contributes its shared text once, at its first name,
+                            // instead of once per name (which would duplicate that whole line for
+                            // every comma-separated name sharing it). Reset on anything that
+                            // isn't itself an authored continuation of the same range, so an
+                            // ancestor-copied name in between never gets bridged across.
+                            let mut last_authored_range: Option<TextRange> = None;
+                            for group in &groups {
+                                let representative = group[0];
+                                let mut used_ancestor = false;
+                                if !effective_overrides.contains(representative) {
+                                    if let Some(ancestor_entry) = inherited_from_ancestors.get(representative) {
+                                        let joined_names: String =
+                                            group.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");
+                                        let candidate = crate::style::numpydoc::render_entry_text(&joined_names, ancestor_entry, newline);
+                                        if safe_to_copy_across_raw_ness(ancestor_entry.is_raw, doc.is_raw, &candidate) {
+                                            if let Some(origin) = &ancestor_entry.origin {
+                                                for name in group {
+                                                    provenance_entries.push(ProvenanceEntry {
+                                                        name: (*name).clone(),
+                                                        origin: origin.clone(),
+                                                    });
+                                                }
                                             }
-                                            diagnostics.push(backslash_raw_mismatch_diagnostic(name, doc.inner_range));
+                                            pieces.push(provenance::maybe_append_inline_note(
+                                                candidate,
+                                                &indent,
+                                                newline,
+                                                provenance_mode,
+                                                ancestor_entry.origin.as_ref(),
+                                            ));
+                                            piece_names.push(representative);
+                                            last_authored_range = None;
+                                            used_ancestor = true;
+                                        } else {
+                                            for name in group {
+                                                diagnostics.push(backslash_raw_mismatch_diagnostic(name, doc.inner_range));
+                                            }
                                         }
                                     }
+                                }
+                                if !used_ancestor {
                                     // Authored (overridden, locally-new, or a non-signature
-                                    // extra): preserve the exact on-disk text untouched.
-                                    match parsed_entries.primary.get(name) {
-                                        Some(existing) => {
-                                            doc.text[usize::from(existing.range.start())..usize::from(existing.range.end())]
-                                                .to_string()
+                                    // extra): preserve the exact on-disk text untouched. A group
+                                    // here is always a singleton -- `group_names_for_rendering`
+                                    // only ever merges names that passed the ancestor-safe check
+                                    // above -- but every member still needs its own turn in case
+                                    // the check above failed for what would otherwise have been a
+                                    // multi-name group.
+                                    for name in group {
+                                        match parsed_entries.primary.get(*name) {
+                                            Some(existing) => {
+                                                if last_authored_range == Some(existing.range) {
+                                                    continue; // comma-group continuation -- nothing more to emit
+                                                }
+                                                last_authored_range = Some(existing.range);
+                                                pieces.push(
+                                                    doc.text[usize::from(existing.range.start())..usize::from(existing.range.end())]
+                                                        .to_string(),
+                                                );
+                                                piece_names.push(name);
+                                            }
+                                            None => {
+                                                pieces.push(String::new());
+                                                piece_names.push(name);
+                                                last_authored_range = None;
+                                            }
                                         }
-                                        None => String::new(),
                                     }
-                                })
-                                .collect();
+                                }
+                            }
 
                             let mut new_block = String::new();
                             for (i, piece) in pieces.iter().enumerate() {
@@ -450,8 +681,8 @@ fn resolve_and_rewrite(
                                     // side didn't exist before, or they weren't neighbors) falls
                                     // back to the tool's own plain single-newline separator.
                                     let gap = original_gap_if_still_adjacent(
-                                        &ordered_names[i - 1],
-                                        &ordered_names[i],
+                                        piece_names[i - 1],
+                                        piece_names[i],
                                         &parsed_entries.primary,
                                         &doc.text,
                                     )
@@ -507,7 +738,20 @@ fn resolve_and_rewrite(
                                     }
                                     body.push_str(indent);
                                     let ancestor_entry = inherited_from_ancestors.get(*name).expect("filtered to inherited names above");
-                                    body.push_str(&style.format_entry(ancestor_entry, "", newline));
+                                    let rendered = style.format_entry(ancestor_entry, "", newline);
+                                    if let Some(origin) = &ancestor_entry.origin {
+                                        provenance_entries.push(ProvenanceEntry {
+                                            name: (*name).clone(),
+                                            origin: origin.clone(),
+                                        });
+                                    }
+                                    body.push_str(&provenance::maybe_append_inline_note(
+                                        rendered,
+                                        indent,
+                                        newline,
+                                        provenance_mode,
+                                        ancestor_entry.origin.as_ref(),
+                                    ));
                                 }
 
                                 let (insertion_point, text) = match parsed_entries.first_section_start {
@@ -553,9 +797,44 @@ fn resolve_and_rewrite(
                                 doc.is_raw,
                                 doc.inner_range,
                                 &style,
+                                provenance_mode,
+                                &mut provenance_entries,
                                 edits,
                                 diagnostics,
                             );
+                        }
+                    }
+
+                    {
+                        // Always reconciled, not just under `Comment` -- a mode switch away from
+                        // `Comment` must still clean up a block a previous run left behind, which
+                        // only happens if this runs every time with an empty entries list (the
+                        // "delete" branch), rather than skipping the whole reconciliation outright.
+                        let entries_if_comment_mode: &[ProvenanceEntry] =
+                            if provenance_mode == ProvenanceMode::Comment { &provenance_entries } else { &[] };
+                        let source = source_by_path.get(&file.path).copied().unwrap_or_default();
+                        let newline = newline_style(&doc.text);
+                        match provenance::reconcile(
+                            source,
+                            doc.literal_range.end(),
+                            &parsed_entries.margin_indent,
+                            newline,
+                            entries_if_comment_mode,
+                        ) {
+                            ReconcileOutcome::NoOp => {}
+                            ReconcileOutcome::Edit(edit) => edits.push(edit),
+                            ReconcileOutcome::Blocked => {
+                                diagnostics.push(Diagnostic {
+                                    code: "DOC013",
+                                    severity: Severity::Warning,
+                                    message: "provenance comment could not be inserted: the \
+                                              docstring shares its closing line with other code \
+                                              (e.g. a `;`-chained statement), which a `#` \
+                                              comment inserted there would silently comment out"
+                                        .to_string(),
+                                    range: doc.inner_range,
+                                });
+                            }
                         }
                     }
 
@@ -568,6 +847,8 @@ fn resolve_and_rewrite(
             }
         }
 
+        local_authored_for_this_class.insert(method_name.clone(), authored.clone());
+
         let mut resolved = inherited_from_ancestors;
         for (name, entry) in authored {
             resolved.insert(name, entry);
@@ -575,8 +856,113 @@ fn resolve_and_rewrite(
         this_view.insert(method_name.clone(), resolved);
     }
 
+    local_authored_memo.insert(class_id.clone(), local_authored_for_this_class);
     memo.insert(class_id.clone(), this_view.clone());
     this_view
+}
+
+/// `class_id`'s own Method Resolution Order, via the same C3 linearization algorithm real Python
+/// uses (`L[C] = C + merge(L[B1], L[B2], ..., L[Bn], [B1, B2, ..., Bn])`) — the project-wide,
+/// fully transitive priority order later used to decide, for any parameter documented by more
+/// than one ancestor, which one actually wins. Returns `[class_id, most-specific ancestor, ...,
+/// least-specific ancestor]`; a caller that only wants the ancestor portion skips index 0.
+/// Memoized per class (the same shared ancestor's MRO would otherwise be recomputed once per
+/// descendant that reaches it).
+///
+/// This is worth doing properly rather than approximating, because the two approaches can give
+/// genuinely different answers, not just different code paths to the same result. Worked example
+/// (the textbook case C3 exists to handle): `Grandparent` documents `x`; `BranchA(Grandparent)`
+/// redocuments `x` with its own text; `BranchB(Grandparent)` doesn't touch `x` at all (pure
+/// pass-through); `Child(BranchB, BranchA)`. True MRO is `Child, BranchB, BranchA, Grandparent`
+/// — `BranchB` doesn't define `x` itself, so resolution continues past it to `BranchA`, whose own
+/// redocumented `x` wins. A scheme that instead merges each *direct* base's own already-flattened
+/// view (this function's own predecessor) can't tell "BranchB's `x` is really Grandparent's,
+/// merely passed through" from "BranchB's `x` is BranchB's own" — both look identical once
+/// flattened — so it has no way to prefer BranchA's more-specific redefinition over what's
+/// actually just Grandparent's value arriving via BranchB. Walking the true MRO and overlaying
+/// only each ancestor's own *local* contribution (see `resolve_and_rewrite`'s use of
+/// `local_authored_memo`, never a flattened view) is what avoids that.
+fn compute_mro(
+    project: &ProjectModel,
+    class_id: &ClassId,
+    memo: &mut HashMap<ClassId, Vec<ClassId>>,
+    diagnostics_by_file: &mut HashMap<PathBuf, Vec<Diagnostic>>,
+) -> Vec<ClassId> {
+    if let Some(cached) = memo.get(class_id) {
+        return cached.clone();
+    }
+    // Placeholder guarding against unbounded recursion on a cyclic base chain -- invalid Python,
+    // but a static tool must not infinitely recurse on malformed/adversarial input either way.
+    memo.insert(class_id.clone(), vec![class_id.clone()]);
+
+    let Some((file, class)) = project.class(class_id) else {
+        let result = vec![class_id.clone()];
+        memo.insert(class_id.clone(), result.clone());
+        return result;
+    };
+
+    let resolved_bases: Vec<ClassId> = class
+        .base_refs
+        .iter()
+        .filter_map(|base_ref| project::resolve_base_ref(project, file, base_ref))
+        .collect();
+    let base_mros: Vec<Vec<ClassId>> = resolved_bases.iter().map(|b| compute_mro(project, b, memo, diagnostics_by_file)).collect();
+
+    let ancestors = c3_merge(&base_mros, &resolved_bases).unwrap_or_else(|| {
+        // Real Python would itself refuse to construct this class (`TypeError: Cannot create a
+        // consistent method resolution order`) -- but docerator operates statically and can't
+        // know whether a class shaped like this is ever actually instantiated, so it degrades
+        // gracefully (declaration-order-ish best effort) with a diagnostic instead of erroring
+        // out or panicking.
+        diagnostics_by_file.entry(file.path.clone()).or_default().push(Diagnostic {
+            code: "DOC014",
+            severity: Severity::Warning,
+            message: "base classes have an inconsistent order (Python itself would refuse to \
+                      construct this hierarchy); falling back to declaration order for inherited \
+                      parameter documentation"
+                .to_string(),
+            range: class.range,
+        });
+        let mut fallback = Vec::new();
+        for base_mro in &base_mros {
+            for c in base_mro {
+                if !fallback.contains(c) {
+                    fallback.push(c.clone());
+                }
+            }
+        }
+        fallback
+    });
+
+    let mut result = vec![class_id.clone()];
+    result.extend(ancestors);
+    memo.insert(class_id.clone(), result.clone());
+    result
+}
+
+/// The core C3 `merge` step: repeatedly takes the first head among `base_mros`/`bases_in_order`
+/// that doesn't appear in the *tail* of any of the others, appends it to the result, and removes
+/// it everywhere, until every list is exhausted. `None` if no valid head can ever be found at
+/// some step — an inconsistent hierarchy, per C3's own consistency requirement.
+fn c3_merge(base_mros: &[Vec<ClassId>], bases_in_order: &[ClassId]) -> Option<Vec<ClassId>> {
+    let mut lists: Vec<Vec<ClassId>> = base_mros.to_vec();
+    lists.push(bases_in_order.to_vec());
+    let mut result = Vec::new();
+    loop {
+        lists.retain(|l| !l.is_empty());
+        if lists.is_empty() {
+            return Some(result);
+        }
+        let selected = lists.iter().find_map(|candidate_list| {
+            let candidate = &candidate_list[0];
+            let in_any_tail = lists.iter().any(|l| l.len() > 1 && l[1..].contains(candidate));
+            (!in_any_tail).then(|| candidate.clone())
+        })?;
+        result.push(selected.clone());
+        for l in &mut lists {
+            l.retain(|c| c != &selected);
+        }
+    }
 }
 
 /// Whether a base-class reference's leading name (the whole name for `BaseRef::Name`, the first
@@ -673,16 +1059,35 @@ fn resolve_style(name: &str, range: TextRange, diagnostics: &mut Vec<Diagnostic>
 }
 
 /// Byte offset (relative to a docstring's own interior text) right after the last existing
-/// entry in `section_entries`, plus the leading indentation to prepend to a newly-inserted line
-/// (a brand-new line has no existing indentation of its own to reuse, unlike a splice-replaced
-/// entry) — borrowed from that same last entry's own line, on the assumption every entry in a
-/// section shares one indentation level (true for any well-formed numpydoc section). `None`
-/// when `section_entries` is empty — there's nothing to anchor to yet in that section.
-fn append_point(section_entries: &IndexMap<String, ParamEntry>, docstring_text: &str) -> Option<(usize, String)> {
-    let last = section_entries.values().max_by_key(|e| e.range.end())?;
-    let insertion = usize::from(last.range.end());
-    let indent = line_indent_before(docstring_text, usize::from(last.range.start()));
-    Some((insertion, indent))
+/// content in this section — either the last real entry in `section_entries`, or a trailing
+/// `*args`/`**kwargs` run past it (`trailing_var_args`), whichever genuinely ends later — plus
+/// the leading indentation to prepend to a newly-inserted line (a brand-new line has no existing
+/// indentation of its own to reuse, unlike a splice-replaced entry) — borrowed from whichever of
+/// the two anchors won, on the assumption every entry/var-args line in a section shares one
+/// indentation level (true for any well-formed numpydoc section). `None` when the section has
+/// neither real entries nor a trailing var-args run — there's nothing to anchor to yet.
+///
+/// A trailing `*args`/`**kwargs` line is never itself a `ParamEntry` (see
+/// `ParsedEntries::primary_trailing_var_args`), so anchoring off `section_entries` alone always
+/// lands *before* it when it's genuinely last — corrupting a freshly-synthesized section header,
+/// or a newly-appended entry, into the middle of the author's own `**kwargs` documentation.
+fn append_point(
+    section_entries: &IndexMap<String, ParamEntry>,
+    trailing_var_args: Option<TextRange>,
+    docstring_text: &str,
+) -> Option<(usize, String)> {
+    let last_named = section_entries.values().max_by_key(|e| e.range.end());
+    let (anchor_start, anchor_end) = match (last_named, trailing_var_args) {
+        (Some(named), Some(var_args)) if named.range.end() >= var_args.end() => {
+            (named.range.start(), named.range.end())
+        }
+        (Some(_), Some(var_args)) => (var_args.start(), var_args.end()),
+        (Some(named), None) => (named.range.start(), named.range.end()),
+        (None, Some(var_args)) => (var_args.start(), var_args.end()),
+        (None, None) => return None,
+    };
+    let indent = line_indent_before(docstring_text, usize::from(anchor_start));
+    Some((usize::from(anchor_end), indent))
 }
 
 /// The whitespace between the start of `offset`'s own line and `offset` itself — used to
@@ -691,6 +1096,32 @@ fn append_point(section_entries: &IndexMap<String, ParamEntry>, docstring_text: 
 fn line_indent_before(docstring_text: &str, offset: usize) -> String {
     let line_start = docstring_text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
     docstring_text[line_start..offset].to_string()
+}
+
+/// Walks backward from `line_start` (which must be the start of some physical line) past any
+/// number of blank lines, returning the byte offset right after the nearest non-blank line's own
+/// content (before its terminator, `\r` included if present) — or `0` if everything before
+/// `line_start` is blank. This is the position a "delete a whole managed block, including the
+/// blank-line gap that separated it from whatever precedes it" edit should start from: deleting
+/// from here through the block's own end reconnects the surrounding text seamlessly (the
+/// preceding content's own line, followed directly by whatever originally followed the block),
+/// instead of leaving a dangling blank line where the block used to be. Mirrors `provenance.rs`'s
+/// `reconcile` delete case, which solves the same problem for a single known anchor point instead
+/// of a general backward scan.
+fn end_of_content_before(docstring_text: &str, mut line_start: usize) -> usize {
+    loop {
+        if line_start == 0 {
+            return 0;
+        }
+        let search_end = line_start - 1; // the '\n' terminating the line right before `line_start`
+        let prev_line_start = docstring_text[..search_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prev_line_content = docstring_text[prev_line_start..search_end].trim_end_matches('\r');
+        if prev_line_content.trim().is_empty() {
+            line_start = prev_line_start;
+            continue;
+        }
+        return prev_line_start + prev_line_content.len();
+    }
 }
 
 /// `"\r\n"` if `docstring_text` already uses CRLF line endings anywhere, else plain `"\n"` — for
@@ -756,15 +1187,25 @@ fn backslash_raw_mismatch_diagnostic(name: &str, range: TextRange) -> Diagnostic
 /// (previously an observed panic against real SimPEG source), bail out and leave the docstring
 /// untouched — the same "don't touch what wasn't understood" stance the parser already takes
 /// elsewhere (e.g. DOC008's backslash-skip).
+///
+/// One legitimate case shares an identical range across several *consecutive* entries on
+/// purpose: `numpydoc`'s `name1, name2 : shared type` syntax documents multiple parameters with
+/// one entry, so `parse_section` inserts the same `range` under every comma-separated name in a
+/// tight run. That's a tie, not an inversion — allowed here explicitly (checked before the
+/// inversion test) — real SimPEG source with `alpha_x, alpha_y, alpha_z : ...` was seen tripping
+/// the inversion check and bailing out (surfacing as spurious `DOC010`s for unrelated inherited
+/// parameters elsewhere in the same docstring) before this carve-out existed.
 fn primary_block_span(entries: &IndexMap<String, ParamEntry>, docstring_text: &str) -> Option<(TextRange, String)> {
     let first = entries.values().next()?;
     let last = entries.values().last()?;
-    let mut prev_end = first.range.start();
+    let mut prev: Option<&ParamEntry> = None;
     for entry in entries.values() {
-        if entry.range.start() < prev_end {
-            return None;
+        if let Some(prev) = prev {
+            if entry.range != prev.range && entry.range.start() < prev.range.end() {
+                return None;
+            }
         }
-        prev_end = entry.range.end();
+        prev = Some(entry);
     }
     let indent = line_indent_before(docstring_text, usize::from(first.range.start()));
     Some((TextRange::new(first.range.start(), last.range.end()), indent))
@@ -800,6 +1241,46 @@ fn original_gap_if_still_adjacent(
     Some(docstring_text[start..end].to_string())
 }
 
+/// When `merge_shared_parameters` is on, groups consecutive names in `names` that are all
+/// auto-managed (not overridden, and documented by some ancestor) and share identical
+/// documentation — type, description, *and* origin — into one run, so the caller can render them
+/// back out as a single `nameA, nameB : shared type` line instead of duplicating the same text
+/// once per name. This mirrors `numpydoc`'s own convention for exactly this, and how the group
+/// was almost certainly documented by whichever ancestor originally authored it. Every other name
+/// — authored, overridden, a run that doesn't match, or grouping simply disabled — is its own
+/// singleton group. Requiring the *origin* to match too (not just the rendered text) keeps a
+/// merged group meaningful for provenance purposes; two coincidentally-identical descriptions from
+/// different ancestors are never merged.
+fn group_names_for_rendering<'a>(
+    names: &'a [String],
+    effective_overrides: &HashSet<String>,
+    inherited_from_ancestors: &IndexMap<String, ParamEntry>,
+    merge_shared_parameters: bool,
+) -> Vec<Vec<&'a String>> {
+    let mut groups: Vec<Vec<&'a String>> = Vec::new();
+    let mut last_entry: Option<&ParamEntry> = None;
+    for name in names {
+        let entry = if merge_shared_parameters && !effective_overrides.contains(name) {
+            inherited_from_ancestors.get(name)
+        } else {
+            None
+        };
+        let extends_last = match (entry, last_entry) {
+            (Some(e), Some(prev)) => {
+                e.type_description == prev.type_description && e.description == prev.description && e.origin == prev.origin
+            }
+            _ => false,
+        };
+        if extends_last {
+            groups.last_mut().expect("extends_last implies a prior group exists").push(name);
+        } else {
+            groups.push(vec![name]);
+        }
+        last_entry = entry;
+    }
+    groups
+}
+
 /// Pulls ancestor-documented parameters that aren't literally named in the local signature into
 /// an auto-managed `Other Parameters` block (the `expand=kwargs` directive) — mirrors the named-
 /// parameter regenerate-or-insert logic above, but all insertions for entries missing from a
@@ -819,6 +1300,8 @@ fn expand_kwargs(
     target_is_raw: bool,
     doc_range: TextRange,
     style: &NumpydocStyle,
+    provenance_mode: ProvenanceMode,
+    provenance_entries: &mut Vec<ProvenanceEntry>,
     edits: &mut Vec<TextEdit>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -833,24 +1316,121 @@ fn expand_kwargs(
     let named: HashSet<&str> = signature_names.iter().map(String::as_str).collect();
     let mut pending_inserts: Vec<String> = Vec::new();
 
+    // When `expand_kwargs=` targets `Parameters`, remove any expand_kwargs-eligible entry left
+    // behind in `Other Parameters` from a prior run under the *other* mode -- otherwise switching
+    // modes would leave the same parameter documented in both sections at once. The reverse
+    // direction (a stale entry left in `Parameters` when the target switches away from it) is
+    // handled by the caller's own whole-block rebuild instead, for free, by simply excluding that
+    // name from what it rebuilds -- see its own comment for why that's the right split: only
+    // `Other Parameters` has no other mechanism ever managing it, so only this direction needs an
+    // explicit removal edit here.
+    if target == ParamSectionKind::Primary {
+        let stale_in_secondary: Vec<String> = parsed_entries
+            .secondary
+            .keys()
+            .filter(|name| {
+                inherited_from_ancestors.contains_key(name.as_str())
+                    && !named.contains(name.as_str())
+                    && !effective_overrides.contains(name.as_str())
+                    && !effective_exclude.contains(name.as_str())
+            })
+            .cloned()
+            .collect();
+        if !stale_in_secondary.is_empty() {
+            let keep: Vec<&String> =
+                parsed_entries.secondary.keys().filter(|n| !stale_in_secondary.contains(*n)).collect();
+            if keep.is_empty() && parsed_entries.secondary_trailing_var_args.is_none() {
+                // Every entry in `Other Parameters` was ours, and there's no hand-written
+                // trailing `*args`/`**kwargs` line to preserve -- the whole section (header
+                // included) is now dead weight; remove it and the blank-line gap that separated
+                // it from whatever precedes it, reconnecting cleanly.
+                //
+                // When a trailing var-args line IS present, falling through to the "some entries
+                // survive" branch below does the right thing for free: `keep` is empty, so
+                // `rebuilt` is the empty-string join of zero entries, and the span (computed from
+                // real `secondary` entries only, same as always) gets replaced with `""` --
+                // removing exactly the stale entries while leaving the header before them and the
+                // var-args line after them untouched, rather than orphaning it below wherever the
+                // header used to be.
+                if let Some(header_start) = parsed_entries.secondary_header_start {
+                    let last =
+                        parsed_entries.secondary.values().max_by_key(|e| e.range.end()).expect("secondary is non-empty here");
+                    let from = end_of_content_before(docstring_text, header_start);
+                    let delete_range = TextRange::new(TextSize::try_from(from).unwrap(), last.range.end());
+                    edits.push(TextEdit::new(offset_range(delete_range, inner_range_start), String::new()));
+                }
+            } else {
+                // Some entries in `Other Parameters` are unrelated to this -- keep the section
+                // and its header, rebuilding just the entries span from the survivors' own
+                // verbatim on-disk text (dropping the stale ones), same as the primary block
+                // rebuild's own "diff the rebuilt span against what's on disk" pattern.
+                let first =
+                    parsed_entries.secondary.values().min_by_key(|e| e.range.start()).expect("secondary is non-empty here");
+                let last =
+                    parsed_entries.secondary.values().max_by_key(|e| e.range.end()).expect("secondary is non-empty here");
+                let indent = line_indent_before(docstring_text, usize::from(first.range.start()));
+                let rebuilt: String = keep
+                    .iter()
+                    .map(|name| {
+                        let entry = parsed_entries.secondary.get(name.as_str()).expect("came from these same keys");
+                        docstring_text[usize::from(entry.range.start())..usize::from(entry.range.end())].to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(&format!("{newline}{indent}"));
+                let span = TextRange::new(first.range.start(), last.range.end());
+                let current = &docstring_text[usize::from(span.start())..usize::from(span.end())];
+                if current != rebuilt {
+                    edits.push(TextEdit::new(offset_range(span, inner_range_start), rebuilt));
+                }
+            }
+        }
+    }
+
     for (name, ancestor_entry) in inherited_from_ancestors.iter() {
         if named.contains(name.as_str()) || effective_overrides.contains(name) || effective_exclude.contains(name) {
             continue;
         }
-        let new_text = style.format_entry(ancestor_entry, "", newline);
-        if !safe_to_copy_across_raw_ness(ancestor_entry.is_raw, target_is_raw, &new_text) {
+        if target == ParamSectionKind::Primary && parsed_entries.primary.contains_key(name) {
+            // Already documented in `Parameters` -- the caller's own whole-block rebuild already
+            // regenerates it as an ordinary auto-managed entry (via the signature/stray-extras
+            // walk, unfiltered for target `Primary`), including its own provenance tracking.
+            // Handling it again here would emit a second edit for the same byte range the
+            // whole-block rebuild's own edit already covers -- `apply_edits` treats overlapping
+            // edits as a bug, not something to merge.
+            continue;
+        }
+        let candidate = style.format_entry(ancestor_entry, "", newline);
+        if !safe_to_copy_across_raw_ness(ancestor_entry.is_raw, target_is_raw, &candidate) {
             diagnostics.push(backslash_raw_mismatch_diagnostic(name, doc_range));
             continue;
         }
+        if let Some(origin) = &ancestor_entry.origin {
+            provenance_entries.push(ProvenanceEntry {
+                name: name.clone(),
+                origin: origin.clone(),
+            });
+        }
+        let new_text = provenance::maybe_append_inline_note(
+            candidate,
+            &parsed_entries.margin_indent,
+            newline,
+            provenance_mode,
+            ancestor_entry.origin.as_ref(),
+        );
         match target_entries.get(name) {
-            Some(existing)
-                if existing.type_description == ancestor_entry.type_description
-                    && existing.description == ancestor_entry.description =>
-            {
-                // already in sync
-            }
             Some(existing) => {
-                edits.push(TextEdit::new(offset_range(existing.range, inner_range_start), new_text));
+                // Compare the fully rendered candidate against the raw on-disk slice, not
+                // `existing`'s structural fields (`type_description`/`description`) against
+                // `ancestor_entry`'s -- inline mode can bake a provenance note into on-disk text
+                // that never appears in `ancestor_entry.description` itself, so a structural
+                // comparison would wrongly see permanent drift and re-emit the same edit forever.
+                // This is also just more directly correct in general: it's exactly what the
+                // primary/secondary block-rebuild path already does (rebuild, then diff against
+                // `current_block`), so `expand_kwargs` now matches that same pattern.
+                let current = &docstring_text[usize::from(existing.range.start())..usize::from(existing.range.end())];
+                if current != new_text {
+                    edits.push(TextEdit::new(offset_range(existing.range, inner_range_start), new_text));
+                }
             }
             None => pending_inserts.push(new_text),
         }
@@ -874,15 +1454,28 @@ fn expand_kwargs(
     // just has nowhere sensible to go yet.
     let fallback_anchor = match target {
         ParamSectionKind::Primary => None,
-        ParamSectionKind::Secondary => append_point(&parsed_entries.primary, docstring_text),
+        ParamSectionKind::Secondary => {
+            append_point(&parsed_entries.primary, parsed_entries.primary_trailing_var_args, docstring_text)
+        }
     };
-    let (anchor, indent, header) = if let Some((insertion, indent)) = append_point(target_entries, docstring_text) {
+    let target_trailing_var_args = match target {
+        ParamSectionKind::Primary => parsed_entries.primary_trailing_var_args,
+        ParamSectionKind::Secondary => parsed_entries.secondary_trailing_var_args,
+    };
+    let (anchor, indent, header) = if let Some((insertion, indent)) =
+        append_point(target_entries, target_trailing_var_args, docstring_text)
+    {
         (insertion, indent, String::new())
     } else if let Some((insertion, indent)) = fallback_anchor {
         let raw_header = style.synthesize_section(target);
         let indented_header: String =
             raw_header.lines().map(|line| format!("{indent}{line}{newline}")).collect();
-        (insertion, indent, format!("{newline}{indented_header}"))
+        // A blank line ahead of the freshly-synthesized section header, separating it from the
+        // `Parameters` section's own last entry immediately above -- matches numpydoc convention
+        // (a section boundary is always blank-line-separated from whatever precedes it) and the
+        // same convention `insert_missing_sections` already follows for a brand-new `Parameters`
+        // section.
+        (insertion, indent, format!("{newline}{newline}{indented_header}"))
     } else {
         // No anchor at all -- nothing sensible to append to yet.
         return;
@@ -919,24 +1512,389 @@ fn offset_diagnostic(diagnostic: Diagnostic, base: TextSize) -> Diagnostic {
 mod tests {
     use super::*;
 
+    // `provenance_mode` off: this helper backs every pre-existing test in this module, almost
+    // all written before provenance annotations existed and asserting exact docstring text that
+    // has nothing to do with them -- defaulting to `Comment` here would bolt an unrelated
+    // comment block onto any of them that happens to exercise inheritance (most of them).
+    // Provenance's own behavior is exercised via `sync_with_provenance_mode` instead.
     fn sync(source: &str) -> (String, Vec<Diagnostic>) {
-        sync_source(source, None).expect("fixture must parse")
+        let options = SyncOptions {
+            project_default_style: None,
+            insert_missing_sections: false,
+            provenance_mode: ProvenanceMode::Off,
+            merge_shared_parameters: false,
+        };
+        sync_source_with_options(source, options).expect("fixture must parse")
+    }
+
+    fn sync_with_provenance_mode(source: &str, provenance_mode: ProvenanceMode) -> (String, Vec<Diagnostic>) {
+        let options = SyncOptions {
+            project_default_style: None,
+            insert_missing_sections: false,
+            provenance_mode,
+            merge_shared_parameters: false,
+        };
+        sync_source_with_options(source, options).expect("fixture must parse")
     }
 
     fn sync_inserting_missing_sections(source: &str) -> (String, Vec<Diagnostic>) {
         let options = SyncOptions {
             project_default_style: None,
             insert_missing_sections: true,
+            // Off here so this helper's pre-existing exact-text assertions (written before
+            // provenance annotations existed) aren't affected by an unrelated feature.
+            provenance_mode: ProvenanceMode::Off,
+            merge_shared_parameters: false,
         };
         sync_source_with_options(source, options).expect("fixture must parse")
     }
 
     fn sync_multi(files: &[(&str, &str)]) -> HashMap<String, FileOutput> {
         let owned: Vec<(PathBuf, String)> = files.iter().map(|(p, t)| (PathBuf::from(p), t.to_string())).collect();
-        sync_project(&owned, None)
+        // Same rationale as `sync`'s own comment: `provenance_mode` off to keep this pre-existing
+        // helper's assertions unaffected by the new, unrelated default.
+        let options = SyncOptions {
+            project_default_style: None,
+            insert_missing_sections: false,
+            provenance_mode: ProvenanceMode::Off,
+            merge_shared_parameters: false,
+        };
+        sync_project_with_options(&owned, options)
             .into_iter()
             .map(|out| (out.path.to_string_lossy().replace('\\', "/"), out))
             .collect()
+    }
+
+    fn sync_merging_shared_parameters(source: &str) -> (String, Vec<Diagnostic>) {
+        let options = SyncOptions {
+            project_default_style: None,
+            insert_missing_sections: false,
+            provenance_mode: ProvenanceMode::Off,
+            merge_shared_parameters: true,
+        };
+        sync_source_with_options(source, options).expect("fixture must parse")
+    }
+
+    // `sync_source`'s test-only synthetic path is always `<source>.py`, so its module name is
+    // always literally `<source>` -- embedded verbatim in the exact-text assertions below.
+    const MULTI_ANCESTOR_PROVENANCE_PY: &str = "\
+class BaseSrc:
+    \"\"\"BaseSrc.
+
+    Parameters
+    ----------
+    location : (3,) array_like
+        Source location.
+    receiver_list : list of BaseRx
+        Receivers.
+    \"\"\"
+
+    def __init__(self, location, receiver_list):
+        pass
+
+
+class BaseFDEMSrc(BaseSrc):
+    \"\"\"BaseFDEMSrc.
+
+    Parameters
+    ----------
+    location : (3,) array_like
+        Source location.
+    receiver_list : list of BaseRx
+        Receivers.
+    frequency : float
+        Source frequency.
+    \"\"\"
+
+    def __init__(self, location, receiver_list, frequency):
+        pass
+
+
+class MagDipole(BaseFDEMSrc):
+    \"\"\"MagDipole.
+
+    Parameters
+    ----------
+    location : (3,) array_like
+        stale
+    receiver_list : list of BaseRx
+        stale
+    frequency : float
+        stale
+    \"\"\"
+
+    def __init__(self, location, receiver_list, frequency):
+        pass
+";
+
+    #[test]
+    fn comment_mode_summarizes_two_distinct_ancestor_origins_grouped_and_ordered_by_signature() {
+        let (output, diagnostics) = sync_with_provenance_mode(MULTI_ANCESTOR_PROVENANCE_PY, ProvenanceMode::Comment);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let mag_dipole = &output[output.find("class MagDipole").unwrap()..];
+        let expected = "\
+class MagDipole(BaseFDEMSrc):
+    \"\"\"MagDipole.
+
+    Parameters
+    ----------
+    location : (3,) array_like
+        Source location.
+    receiver_list : list of BaseRx
+        Receivers.
+    frequency : float
+        Source frequency.
+    \"\"\"
+    # docerator: provenance
+    # docerator: from <source>.BaseSrc: location, receiver_list
+    # docerator: from <source>.BaseFDEMSrc: frequency
+
+    def __init__(self, location, receiver_list, frequency):
+        pass
+";
+        assert_eq!(mag_dipole, expected);
+    }
+
+    #[test]
+    fn comment_mode_is_a_noop_on_a_second_run_with_no_underlying_changes() {
+        let (first, diagnostics) = sync_with_provenance_mode(MULTI_ANCESTOR_PROVENANCE_PY, ProvenanceMode::Comment);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let (second, diagnostics) = sync_with_provenance_mode(&first, ProvenanceMode::Comment);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert_eq!(first, second, "a second run must not change anything further");
+    }
+
+    #[test]
+    fn provenance_off_produces_no_block() {
+        let (output, diagnostics) = sync_with_provenance_mode(MULTI_ANCESTOR_PROVENANCE_PY, ProvenanceMode::Off);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert!(!output.contains("docerator: provenance"));
+    }
+
+    #[test]
+    fn switching_from_comment_to_off_deletes_a_previously_inserted_block() {
+        let (with_comment, _) = sync_with_provenance_mode(MULTI_ANCESTOR_PROVENANCE_PY, ProvenanceMode::Comment);
+        assert!(with_comment.contains("docerator: provenance"));
+        let (after_off, diagnostics) = sync_with_provenance_mode(&with_comment, ProvenanceMode::Off);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert!(!after_off.contains("docerator: provenance"));
+        let (direct_off, _) = sync_with_provenance_mode(MULTI_ANCESTOR_PROVENANCE_PY, ProvenanceMode::Off);
+        assert_eq!(after_off, direct_off, "switching to Off must converge to the same text as a from-scratch Off run");
+    }
+
+    #[test]
+    fn switching_from_comment_to_inline_deletes_the_comment_block_and_adds_inline_notes() {
+        let (with_comment, _) = sync_with_provenance_mode(MULTI_ANCESTOR_PROVENANCE_PY, ProvenanceMode::Comment);
+        let (after_inline, diagnostics) = sync_with_provenance_mode(&with_comment, ProvenanceMode::Inline);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert!(!after_inline.contains("docerator: provenance"));
+        assert!(after_inline.contains("(Inherited from <source>.BaseSrc.)"));
+        assert!(after_inline.contains("(Inherited from <source>.BaseFDEMSrc.)"));
+    }
+
+    #[test]
+    fn switching_from_inline_to_comment_strips_the_baked_in_note_from_disk() {
+        let (with_inline, _) = sync_with_provenance_mode(MULTI_ANCESTOR_PROVENANCE_PY, ProvenanceMode::Inline);
+        assert!(with_inline.contains("(Inherited from"));
+        let (after_comment, diagnostics) = sync_with_provenance_mode(&with_inline, ProvenanceMode::Comment);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert!(!after_comment.contains("(Inherited from"));
+        let (direct_comment, _) = sync_with_provenance_mode(MULTI_ANCESTOR_PROVENANCE_PY, ProvenanceMode::Comment);
+        assert_eq!(after_comment, direct_comment, "switching to Comment must converge to the same text as a from-scratch Comment run");
+    }
+
+    #[test]
+    fn inline_mode_is_idempotent_on_rerun() {
+        let (first, diagnostics) = sync_with_provenance_mode(MULTI_ANCESTOR_PROVENANCE_PY, ProvenanceMode::Inline);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let (second, diagnostics) = sync_with_provenance_mode(&first, ProvenanceMode::Inline);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert_eq!(first, second, "a second run must not change anything further");
+    }
+
+    #[test]
+    fn override_and_locally_authored_entries_never_receive_provenance() {
+        let source = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    arg1 : int
+        Base doc.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+# docerator: override=arg1
+class Child(Base):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Child's own, locally authored text.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let (output, diagnostics) = sync_with_provenance_mode(source, ProvenanceMode::Comment);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(!child.contains("docerator: provenance"), "an overridden entry must never appear in a provenance block");
+
+        let (inline_output, diagnostics) = sync_with_provenance_mode(source, ProvenanceMode::Inline);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert!(!inline_output.contains("Inherited from"), "an overridden entry must never receive an inline note");
+    }
+
+    #[test]
+    fn an_entry_withheld_for_raw_ness_mismatch_gets_no_provenance_note() {
+        let source = "\
+class Base:
+    r\"\"\"Base.
+
+    Parameters
+    ----------
+    arg1 : int
+        Uses a backslash: \\alpha.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Child(Base):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should NOT resync -- raw-ness mismatch makes it unsafe.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let (output, diagnostics) = sync_with_provenance_mode(source, ProvenanceMode::Comment);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "DOC008");
+        assert!(!output.contains("docerator: provenance"), "an entry withheld for raw-ness safety must not appear in a provenance block");
+    }
+
+    const EXPAND_KWARGS_PROVENANCE_PY: &str = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    extra1 : int
+        Extra1 doc.
+    extra2 : str
+        Extra2 doc.
+    \"\"\"
+
+    def __init__(self, extra1=1, extra2=\"x\"):
+        pass
+
+
+# docerator: expand_kwargs
+class Child(Base):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+
+    Other Parameters
+    ----------------
+    extra1 : int
+        stale
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+
+    #[test]
+    fn inline_mode_appends_a_note_to_expand_kwargs_targets_both_regenerated_and_newly_inserted() {
+        let (output, diagnostics) = sync_with_provenance_mode(EXPAND_KWARGS_PROVENANCE_PY, ProvenanceMode::Inline);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(
+            child.contains("extra1 : int\n        Extra1 doc.\n        (Inherited from <source>.Base.)"),
+            "regenerated existing entry should get a note:\n{child}"
+        );
+        assert!(
+            child.contains("extra2 : str\n        Extra2 doc.\n        (Inherited from <source>.Base.)"),
+            "newly-inserted entry should get a note:\n{child}"
+        );
+    }
+
+    #[test]
+    fn comment_mode_covers_expand_kwargs_targets_too() {
+        let (output, diagnostics) = sync_with_provenance_mode(EXPAND_KWARGS_PROVENANCE_PY, ProvenanceMode::Comment);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(child.contains("# docerator: from <source>.Base: extra1, extra2"), "got:\n{child}");
+    }
+
+    #[test]
+    fn expand_kwargs_in_sync_check_compares_rendered_text_not_structural_fields() {
+        // Regression test for the fix this feature required: `extra1`'s structural fields
+        // (`type_description`/`description`) match the ancestor's exactly, but under Inline mode
+        // the on-disk text (from a prior Comment-mode run, with no note baked in) differs from
+        // what Inline mode would render (which does have a note) -- an edit must still be
+        // emitted, not skipped as "already in sync" by a stale structural-only comparison.
+        let (comment_output, _) = sync_with_provenance_mode(EXPAND_KWARGS_PROVENANCE_PY, ProvenanceMode::Comment);
+        let (inline_output, diagnostics) = sync_with_provenance_mode(&comment_output, ProvenanceMode::Inline);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &inline_output[inline_output.find("class Child").unwrap()..];
+        assert!(
+            child.contains("extra1 : int\n        Extra1 doc.\n        (Inherited from <source>.Base.)"),
+            "expected the inline note to actually be applied on this run, got:\n{child}"
+        );
+    }
+
+    #[test]
+    fn hand_written_content_right_after_the_docstring_blocks_provenance_comment_insertion() {
+        // Child's own `arg1` text already matches Base's exactly, so the Parameters section
+        // itself needs no edit at all -- isolating this test to *only* the blocked comment
+        // insertion, so `output == source` cleanly proves nothing else was touched either.
+        let source = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    arg1 : int
+        Base doc.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Child(Base):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Base doc.
+    \"\"\"; real_code_on_the_same_line = 1
+
+    def __init__(self, arg1):
+        pass
+";
+        let (output, diagnostics) = sync_with_provenance_mode(source, ProvenanceMode::Comment);
+        assert_eq!(output, source, "must never risk corrupting a semicolon-chained statement");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "DOC013");
     }
 
     #[test]
@@ -1367,6 +2325,7 @@ class Child(Parent):
     ----------
     arg1 : int
         Arg1 doc.
+
     Other Parameters
     ----------------
     extra1 : bool
@@ -1516,6 +2475,640 @@ class Child(Parent):
     }
 
     #[test]
+    fn expand_kwargs_synthesizes_other_parameters_after_an_existing_trailing_kwargs_line() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, **kwargs):
+        pass
+
+
+# docerator: expand_kwargs
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    **kwargs
+        Forwarded to :py:class:`.Parent`.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+
+        let expected = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, **kwargs):
+        pass
+
+
+# docerator: expand_kwargs
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    **kwargs
+        Forwarded to :py:class:`.Parent`.
+
+    Other Parameters
+    ----------------
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn expand_kwargs_appends_to_existing_other_parameters_section_past_its_own_trailing_kwargs_line() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    extra2 : float
+        Extra2 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, extra2, **kwargs):
+        pass
+
+
+# docerator: expand_kwargs
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+
+    Other Parameters
+    ----------------
+    extra1 : bool
+        Extra1 doc.
+    **kwargs
+        Forwarded to :py:class:`.Parent`.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+
+        let expected = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    extra2 : float
+        Extra2 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, extra2, **kwargs):
+        pass
+
+
+# docerator: expand_kwargs
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+
+    Other Parameters
+    ----------------
+    extra1 : bool
+        Extra1 doc.
+    **kwargs
+        Forwarded to :py:class:`.Parent`.
+    extra2 : float
+        Extra2 doc.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn expand_kwargs_into_parameters_appends_past_an_existing_trailing_kwargs_line() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, **kwargs):
+        pass
+
+
+# docerator: expand_kwargs=parameters
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    **kwargs
+        Forwarded to :py:class:`.Parent`.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+
+        let expected = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, **kwargs):
+        pass
+
+
+# docerator: expand_kwargs=parameters
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    **kwargs
+        Forwarded to :py:class:`.Parent`.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        assert_eq!(output, expected);
+        assert!(!output.contains("Other Parameters"));
+    }
+
+    #[test]
+    fn expand_kwargs_mode_switch_to_parameters_does_not_orphan_a_hand_written_kwargs_in_other_parameters() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, **kwargs):
+        pass
+
+
+# docerator: expand_kwargs=parameters
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+
+    Other Parameters
+    ----------------
+    extra1 : bool
+        Extra1 doc.
+    **kwargs
+        Forwarded to :py:class:`.Parent`.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        // the stale `Other Parameters` copy of extra1 is gone (it now lives in Parameters)...
+        assert_eq!(child.matches("extra1").count(), 1);
+        // ...but the section header and the hand-written kwargs line both survive intact.
+        assert!(child.contains("Other Parameters"));
+        assert!(child.contains("**kwargs\n        Forwarded to :py:class:`.Parent`."));
+    }
+
+    #[test]
+    fn primary_block_rebuild_never_touches_a_trailing_kwargs_line() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, **kwargs):
+        pass
+
+
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc, stale text that needs resyncing.
+    **kwargs
+        Forwarded to :py:class:`.Parent`.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(child.contains("arg1 : int\n        Arg1 doc."));
+        assert!(!child.contains("stale text"));
+        // the newly-inserted extra1 lands before **kwargs, which stays last, untouched.
+        let extra1_pos = child.find("extra1").unwrap();
+        let kwargs_pos = child.find("**kwargs").unwrap();
+        assert!(extra1_pos < kwargs_pos);
+        assert!(child.contains("**kwargs\n        Forwarded to :py:class:`.Parent`."));
+    }
+
+    #[test]
+    fn expand_kwargs_past_trailing_kwargs_is_idempotent_on_rerun() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1, **kwargs):
+        pass
+
+
+# docerator: expand_kwargs
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    **kwargs
+        Forwarded to :py:class:`.Parent`.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (first_pass, _) = sync(source);
+        let (second_pass, diagnostics) = sync(&first_pass);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert_eq!(first_pass, second_pass);
+    }
+
+    #[test]
+    fn synthesizing_other_parameters_from_scratch_leaves_a_blank_line_before_it() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1):
+        pass
+
+
+# docerator: expand_kwargs
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(
+            child.contains("arg1 : int\n        Arg1 doc.\n\n    Other Parameters\n    ----------------\n"),
+            "got:\n{child}"
+        );
+    }
+
+    #[test]
+    fn switching_expand_kwargs_from_other_to_parameters_removes_the_whole_other_section_when_emptied() {
+        // Child's docstring already has `extra1` documented in `Other Parameters` (simulating a
+        // prior run under bare `expand_kwargs`), but the directive now targets `Parameters`
+        // instead -- `extra1` must move, and since it was the *only* entry in `Other Parameters`,
+        // that whole section (header included) must be removed, not left behind empty.
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1):
+        pass
+
+
+# docerator: expand_kwargs=parameters
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+
+    Other Parameters
+    ----------------
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(!child.contains("Other Parameters"), "got:\n{child}");
+        assert_eq!(child.matches("extra1").count(), 1, "extra1 must be documented exactly once:\n{child}");
+        assert!(child.contains("arg1 : int\n        Arg1 doc.\n    extra1 : bool\n        Extra1 doc.\n    \"\"\""), "got:\n{child}");
+    }
+
+    #[test]
+    fn switching_expand_kwargs_from_other_to_parameters_keeps_unrelated_other_parameters_entries() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1):
+        pass
+
+
+# docerator: expand_kwargs=parameters
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+
+    Other Parameters
+    ----------------
+    extra1 : bool
+        Extra1 doc.
+    unrelated : str
+        Not from expand_kwargs at all.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert_eq!(child.matches("extra1").count(), 1, "extra1 must be documented exactly once:\n{child}");
+        assert!(
+            child.contains("Other Parameters\n    ----------------\n    unrelated : str\n        Not from expand_kwargs at all."),
+            "unrelated entry must survive in Other Parameters:\n{child}"
+        );
+    }
+
+    #[test]
+    fn switching_expand_kwargs_from_parameters_to_other_does_not_leave_a_stray_copy_behind() {
+        // Child's docstring already has `extra1` documented in `Parameters` (simulating a prior
+        // run under `expand_kwargs=parameters`), but the directive is now bare `expand_kwargs`
+        // (targeting `Other Parameters` instead) -- `extra1` must move, not end up in both places.
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1):
+        pass
+
+
+# docerator: expand_kwargs
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert_eq!(child.matches("extra1").count(), 1, "extra1 must be documented exactly once:\n{child}");
+        assert!(child.contains("Other Parameters"), "got:\n{child}");
+        let parameters_section = &child[..child.find("Other Parameters").unwrap()];
+        assert!(!parameters_section.contains("extra1"), "extra1 must not remain in Parameters:\n{child}");
+    }
+
+    #[test]
+    fn switching_expand_kwargs_modes_is_idempotent_on_rerun() {
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, extra1):
+        pass
+
+
+# docerator: expand_kwargs=parameters
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+
+    Other Parameters
+    ----------------
+    extra1 : bool
+        Extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (first_pass, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let (second_pass, diagnostics) = sync(&first_pass);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert_eq!(first_pass, second_pass, "a second run must not change anything further");
+    }
+
+    #[test]
+    fn stale_entry_already_present_under_target_parameters_resyncs_without_an_overlapping_edit_panic() {
+        // A latent, pre-existing correctness gap this same fix closes: with `expand_kwargs=
+        // parameters` targeting an entry that's *already* documented (with stale text) in
+        // `Parameters`, the whole-block rebuild and `expand_kwargs`'s own per-entry update used
+        // to both try to edit the exact same byte range -- `apply_edits` panics on overlapping
+        // edits. `expand_kwargs` must defer entirely to the whole-block rebuild here.
+        let source = "\
+class Parent:
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Extra1 doc, UPDATED.
+    \"\"\"
+
+    def __init__(self, arg1, extra1):
+        pass
+
+
+# docerator: expand_kwargs=parameters
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    extra1 : bool
+        Stale extra1 doc.
+    \"\"\"
+
+    def __init__(self, arg1, **kwargs):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(child.contains("extra1 : bool\n        Extra1 doc, UPDATED."), "got:\n{child}");
+        assert!(!child.contains("Stale extra1 doc."), "got:\n{child}");
+    }
+
+    #[test]
     fn expand_kwargs_unrecognized_value_is_diagnosed_and_defaults_to_others() {
         let source = "\
 class Parent:
@@ -1642,6 +3235,276 @@ class Child(Base):
         let child_out = &outputs["pkg/child.py"];
         assert!(child_out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", child_out.diagnostics);
         assert!(child_out.text.contains("Arg1 doc, from Base."));
+    }
+
+    #[test]
+    fn resolves_base_class_through_attribute_access_on_a_name_imported_submodule() {
+        // `from . import base` binds `base` via `ImportedSymbol::Name`, not `ImportedSymbol::
+        // Module` -- Python's `from pkg import name` doesn't distinguish "name is a symbol
+        // defined in pkg" from "name is itself one of pkg's submodules" at the syntax level, and
+        // `base` here really is the sibling module `pkg/base.py`. Real-world shape this mirrors:
+        // SimPEG's `frequency_domain/receivers.py` does `from ... import survey` then
+        // `class BaseRx(survey.BaseRx):`.
+        let child = child_using("from . import base");
+        let child = child.replacen("class Child(Base):", "class Child(base.Base):", 1);
+        let outputs = sync_multi(&[("pkg/__init__.py", ""), ("pkg/base.py", BASE_PY), ("pkg/child.py", &child)]);
+
+        let child_out = &outputs["pkg/child.py"];
+        assert!(child_out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", child_out.diagnostics);
+        assert!(child_out.text.contains("Arg1 doc, from Base."));
+        assert!(!child_out.text.contains("Stale text"));
+    }
+
+    #[test]
+    fn resolves_base_class_through_attribute_access_on_a_name_imported_submodule_several_levels_up() {
+        // Mirrors the exact real-world shape reported: a file nested several packages deep
+        // climbs multiple levels (`from ... import survey`) to reach a top-level sibling module,
+        // then uses attribute access on it for the base class.
+        let child = child_using("from ... import base");
+        let child = child.replacen("class Child(Base):", "class Child(base.Base):", 1);
+        let outputs = sync_multi(&[
+            ("pkg/__init__.py", ""),
+            ("pkg/base.py", BASE_PY),
+            ("pkg/sub/__init__.py", ""),
+            ("pkg/sub/deeper/__init__.py", ""),
+            ("pkg/sub/deeper/child.py", &child),
+        ]);
+
+        let child_out = &outputs["pkg/sub/deeper/child.py"];
+        assert!(child_out.diagnostics.is_empty(), "unexpected diagnostics: {:?}", child_out.diagnostics);
+        assert!(child_out.text.contains("Arg1 doc, from Base."));
+    }
+
+    #[test]
+    fn resolves_parameters_from_multiple_base_classes() {
+        // `resolve_and_rewrite` used to track only the *first* resolvable base ref, silently
+        // ignoring every other one -- a class with true multiple inheritance only ever inherited
+        // documentation from whichever base happened to be listed first.
+        let source = "\
+class BaseA:
+    \"\"\"BaseA.
+
+    Parameters
+    ----------
+    arg_a : int
+        From BaseA.
+    \"\"\"
+
+    def __init__(self, arg_a=None):
+        pass
+
+
+class BaseB:
+    \"\"\"BaseB.
+
+    Parameters
+    ----------
+    arg_b : str
+        From BaseB.
+    \"\"\"
+
+    def __init__(self, arg_b=None):
+        pass
+
+
+class Child(BaseA, BaseB):
+    \"\"\"Child.
+
+    Does some child-specific things.
+    \"\"\"
+
+    def __init__(self, arg_a=None, arg_b=None):
+        pass
+";
+        let (output, diagnostics) = sync_inserting_missing_sections(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(child.contains("arg_a : int\n        From BaseA."), "got:\n{child}");
+        assert!(child.contains("arg_b : str\n        From BaseB."), "got:\n{child}");
+    }
+
+    #[test]
+    fn earlier_declared_base_wins_when_two_bases_document_the_same_parameter_differently() {
+        // Approximates Python's real left-to-right MRO priority among direct bases without
+        // implementing full C3 linearization (see `resolve_and_rewrite`'s own doc comment).
+        let source = "\
+class BaseA:
+    \"\"\"BaseA.
+
+    Parameters
+    ----------
+    arg : int
+        From BaseA, should win.
+    \"\"\"
+
+    def __init__(self, arg=None):
+        pass
+
+
+class BaseB:
+    \"\"\"BaseB.
+
+    Parameters
+    ----------
+    arg : int
+        From BaseB, should lose.
+    \"\"\"
+
+    def __init__(self, arg=None):
+        pass
+
+
+class Child(BaseA, BaseB):
+    \"\"\"Child.
+
+    Does some child-specific things.
+    \"\"\"
+
+    def __init__(self, arg=None):
+        pass
+";
+        let (output, diagnostics) = sync_inserting_missing_sections(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(child.contains("arg : int\n        From BaseA, should win."), "got:\n{child}");
+        assert!(!child.contains("From BaseB"), "got:\n{child}");
+    }
+
+    #[test]
+    fn diamond_inheritance_shared_ancestor_contributes_once_correctly() {
+        // BaseA and BaseB both reach CommonBase -- the shared ancestor's own entry must show up
+        // exactly once, correctly, regardless of which of the two paths "wins" the merge (both
+        // paths resolve the identical memoized CommonBase view, so there's nothing to conflict).
+        let source = "\
+class CommonBase:
+    \"\"\"CommonBase.
+
+    Parameters
+    ----------
+    common_arg : int
+        From CommonBase.
+    \"\"\"
+
+    def __init__(self, common_arg=None):
+        pass
+
+
+class BaseA(CommonBase):
+    \"\"\"BaseA.
+
+    Parameters
+    ----------
+    arg_a : int
+        From BaseA.
+    \"\"\"
+
+    def __init__(self, arg_a=None, common_arg=None):
+        pass
+
+
+class BaseB(CommonBase):
+    \"\"\"BaseB.
+
+    Parameters
+    ----------
+    arg_b : int
+        From BaseB.
+    \"\"\"
+
+    def __init__(self, arg_b=None, common_arg=None):
+        pass
+
+
+class Child(BaseA, BaseB):
+    \"\"\"Child.
+
+    Does some child-specific things.
+    \"\"\"
+
+    def __init__(self, arg_a=None, arg_b=None, common_arg=None):
+        pass
+";
+        let (output, diagnostics) = sync_inserting_missing_sections(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(child.contains("arg_a : int\n        From BaseA."), "got:\n{child}");
+        assert!(child.contains("arg_b : int\n        From BaseB."), "got:\n{child}");
+        assert_eq!(
+            child.matches("common_arg : int\n        From CommonBase.").count(),
+            1,
+            "shared ancestor entry must appear exactly once:\n{child}"
+        );
+    }
+
+    #[test]
+    fn true_mro_prefers_a_more_specific_override_reached_through_a_non_overriding_branch() {
+        // The textbook case C3 linearization exists to handle, and the exact scenario where a
+        // simpler "merge each direct base's own already-flattened view in reverse declaration
+        // order" scheme (this engine's own earlier, since-replaced implementation) gets the
+        // wrong answer: `Grandparent` documents `x`; `BranchA(Grandparent)` redocuments it with
+        // its own text (via `override=x` -- without that directive, a class's own inherited-but-
+        // unoverridden text is just drift the tool resyncs back to the ancestor's, an unrelated,
+        // pre-existing rule, so this scenario needs a genuine override to set up at all);
+        // `BranchB(Grandparent)` never touches `x` (pure pass-through). `Child(BranchB, BranchA)`
+        // -- note `BranchB` is declared FIRST. True MRO is `Child, BranchB, BranchA, Grandparent`:
+        // `BranchB` doesn't define `x` itself, so resolution continues past it to `BranchA`,
+        // whose own override wins -- even though `BranchB` was declared first. The old simplified
+        // scheme couldn't tell "BranchB's `x` is really just Grandparent's, merely passed through"
+        // from "BranchB's `x` is its own" (both look identical once flattened), so it incorrectly
+        // let the first-declared `BranchB` win with Grandparent's stale text.
+        let source = "\
+class Grandparent:
+    \"\"\"Grandparent.
+
+    Parameters
+    ----------
+    x : int
+        From Grandparent, should lose.
+    \"\"\"
+
+    def __init__(self, x=None):
+        pass
+
+
+
+# docerator: override=x
+class BranchA(Grandparent):
+    \"\"\"BranchA.
+
+    Parameters
+    ----------
+    x : int
+        From BranchA, should win.
+    \"\"\"
+
+    def __init__(self, x=None):
+        pass
+
+
+class BranchB(Grandparent):
+    \"\"\"BranchB.
+
+    Does not redocument x at all -- pure pass-through from Grandparent.
+    \"\"\"
+
+    def __init__(self, x=None):
+        pass
+
+
+class Child(BranchB, BranchA):
+    \"\"\"Child.
+
+    Does some child-specific things.
+    \"\"\"
+
+    def __init__(self, x=None):
+        pass
+";
+        let (output, diagnostics) = sync_inserting_missing_sections(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(child.contains("x : int\n        From BranchA, should win."), "got:\n{child}");
+        assert!(!child.contains("From Grandparent"), "got:\n{child}");
     }
 
     #[test]
@@ -1827,6 +3690,90 @@ class Base:
     }
 
     #[test]
+    fn multiple_inheritance_still_resolves_correctly_when_every_ancestor_is_served_from_cache() {
+        // `local_authored_memo` (the per-class "own contribution only" data the MRO merge reads)
+        // is only ever populated by actually running a class's own per-method loop -- which a
+        // cache hit skips entirely. Without also persisting it on disk (`CachedFile::
+        // local_authored`) and restoring it into `local_authored_memo` on a cache hit, a
+        // multiple-inheritance descendant reprocessed on a *later* run (while every one of its
+        // ancestors stays fully cache-valid) would silently lose every cache-served ancestor's
+        // contribution.
+        let base_a = "\
+class BaseA:
+    \"\"\"BaseA.
+
+    Parameters
+    ----------
+    arg_a : int
+        From BaseA.
+    \"\"\"
+
+    def __init__(self, arg_a=None):
+        pass
+";
+        let base_b = "\
+class BaseB:
+    \"\"\"BaseB.
+
+    Parameters
+    ----------
+    arg_b : str
+        From BaseB.
+    \"\"\"
+
+    def __init__(self, arg_b=None):
+        pass
+";
+        let child_v1 = "\
+from .base_a import BaseA
+from .base_b import BaseB
+
+
+class Child(BaseA, BaseB):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg_a : int
+        Stale.
+    arg_b : str
+        Stale.
+    \"\"\"
+
+    def __init__(self, arg_a=None, arg_b=None):
+        pass
+";
+        let files_v1 = owned_files(&[
+            ("pkg/__init__.py", ""),
+            ("pkg/base_a.py", base_a),
+            ("pkg/base_b.py", base_b),
+            ("pkg/child.py", child_v1),
+        ]);
+        let mut cache = Cache::default();
+        let first = sync_project_with_cache(&files_v1, None, &mut cache);
+        let first_child = text_for(&first, "pkg/child.py");
+        assert!(first_child.contains("arg_a : int\n        From BaseA."), "got:\n{first_child}");
+        assert!(first_child.contains("arg_b : str\n        From BaseB."), "got:\n{first_child}");
+
+        // Round 2: child.py's content changes (to its own round-1 output -- already correctly
+        // resynced, but a different byte sequence from round 1's original input, so its cache
+        // entry is invalidated and it gets reprocessed); base_a.py/base_b.py are byte-identical
+        // to round 1, so both stay fully cache-valid and get served from `memo`/
+        // `local_authored_memo` rather than actually reprocessed.
+        let files_v2 = owned_files(&[
+            ("pkg/__init__.py", ""),
+            ("pkg/base_a.py", base_a),
+            ("pkg/base_b.py", base_b),
+            ("pkg/child.py", first_child),
+        ]);
+        let second = sync_project_with_cache(&files_v2, None, &mut cache);
+        let second_child = text_for(&second, "pkg/child.py");
+        assert_eq!(second_child, first_child, "a reprocessed descendant must not lose a cache-served ancestor's contribution");
+        assert!(second_child.contains("arg_a : int\n        From BaseA."), "got:\n{second_child}");
+        assert!(second_child.contains("arg_b : str\n        From BaseB."), "got:\n{second_child}");
+    }
+
+    #[test]
     fn cache_is_invalidated_when_project_default_style_changes() {
         let source = "\
 class Solo:
@@ -1908,6 +3855,238 @@ class Child(Parent):
         assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
         assert!(output.contains("Arg1 doc, from Grandparent."));
         assert!(!output.contains("Stale text that should sync"));
+    }
+
+    #[test]
+    fn a_class_with_no_init_of_its_own_still_resyncs_its_own_class_level_docstring() {
+        // Real-world regression (found against SimPEG's `TimeFields`/`Simulation3DElectricField`,
+        // both `pass`-style -- no `__init__` of their own -- with a full `Parameters` section
+        // documenting the inherited constructor anyway, by numpydoc convention). Without a
+        // synthesized `__init__` entry, `class.methods` has nothing to iterate for this class at
+        // all, so its own docstring was previously completely invisible to the whole engine --
+        // never parsed, never checked, never resynced, forever.
+        let source = "\
+class Grandparent:
+    \"\"\"Grandparent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc, from Grandparent.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Parent(Grandparent):
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should resync even though Parent has no __init__ of its own.
+    \"\"\"
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let parent = &output[output.find("class Parent").unwrap()..];
+        assert!(parent.contains("Arg1 doc, from Grandparent."), "got:\n{parent}");
+        assert!(!parent.contains("Stale text"), "got:\n{parent}");
+    }
+
+    #[test]
+    fn a_chain_of_init_less_classes_still_borrows_the_signature_from_further_up_the_mro() {
+        // `Parent` has neither its own `__init__` nor its own docstring (nothing to synthesize
+        // for it at all) -- `Middle`'s own synthesis must walk straight past it to `Grandparent`.
+        let source = "\
+class Grandparent:
+    \"\"\"Grandparent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc, from Grandparent.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Parent(Grandparent):
+    pass
+
+
+class Middle(Parent):
+    \"\"\"Middle.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text.
+    \"\"\"
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let middle = &output[output.find("class Middle").unwrap()..];
+        assert!(middle.contains("Arg1 doc, from Grandparent."), "got:\n{middle}");
+        assert!(!middle.contains("Stale text"), "got:\n{middle}");
+    }
+
+    #[test]
+    fn an_init_less_class_with_no_ancestor_defining_init_anywhere_is_left_untouched() {
+        // No `__init__` anywhere in the chain to borrow a signature from -- nothing safe to
+        // synthesize, so this docstring stays exactly as it was, same as before this feature.
+        let source = "\
+class Standalone:
+    \"\"\"Standalone.
+
+    Parameters
+    ----------
+    arg1 : int
+        Some doc that looks like it should sync, but there is no ancestor __init__ to check it against.
+    \"\"\"
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert_eq!(output, source);
+    }
+
+    #[test]
+    fn class_level_skip_suppresses_the_synthesized_init_too() {
+        let source = "\
+class Grandparent:
+    \"\"\"Grandparent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc, from Grandparent.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+# docerator: skip
+class Parent(Grandparent):
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Deliberately different text, must survive untouched because of skip.
+    \"\"\"
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert_eq!(output, source);
+    }
+
+    #[test]
+    fn an_init_less_class_missing_a_borrowed_parameter_gets_it_auto_inserted() {
+        // Same "insert a missing-but-inherited entry into an already-existing `Parameters`
+        // section" behavior any ordinary (non-synthesized) `__init__` already gets — the virtual
+        // entry is processed by the exact same per-method logic, not a separate code path.
+        let source = "\
+class Grandparent:
+    \"\"\"Grandparent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    arg2 : str
+        Arg2 doc.
+    \"\"\"
+
+    def __init__(self, arg1, arg2):
+        pass
+
+
+class Parent(Grandparent):
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc.
+    \"\"\"
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let parent = &output[output.find("class Parent").unwrap()..];
+        assert!(parent.contains("arg2 : str\n        Arg2 doc."), "got:\n{parent}");
+    }
+
+    #[test]
+    fn origin_survives_a_non_overriding_intermediate_ancestor() {
+        // Same shape as the M8 pass-through fixture above, but inspecting `resolve_and_rewrite`'s
+        // own returned `MethodViews` directly (rather than the synced text) to prove `arg1`'s
+        // stamped origin names Grandparent -- the class that *really* authored it -- even though
+        // it reaches Child by passing straight through the non-overriding Parent.
+        let source = "\
+class Grandparent:
+    \"\"\"Grandparent.
+
+    Parameters
+    ----------
+    arg1 : int
+        Arg1 doc, from Grandparent.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+
+
+class Parent(Grandparent):
+    pass
+
+
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : int
+        Stale text that should sync from Grandparent, through the non-overriding Parent.
+    \"\"\"
+
+    def __init__(self, arg1):
+        pass
+";
+        let path = PathBuf::from("pkg_test.py");
+        let files = [(path, source.to_string())];
+        let mut diagnostics_by_file = HashMap::new();
+        let project = project::build_project(&files, &mut diagnostics_by_file);
+        let source_by_path: HashMap<&PathBuf, &str> = files.iter().map(|(p, t)| (p, t.as_str())).collect();
+        let mut mro_memo = HashMap::new();
+        let mut local_authored_memo = HashMap::new();
+        let mut memo = HashMap::new();
+        let mut edits_by_file = HashMap::new();
+        let child_id = ClassId {
+            module: "pkg_test".to_string(),
+            name: "Child".to_string(),
+        };
+        let views = resolve_and_rewrite(
+            &project,
+            &child_id,
+            None,
+            false,
+            ProvenanceMode::Off,
+            false,
+            &source_by_path,
+            &mut mro_memo,
+            &mut local_authored_memo,
+            &mut memo,
+            &mut edits_by_file,
+            &mut diagnostics_by_file,
+        );
+        let arg1 = views.get("__init__").and_then(|m| m.get("arg1")).expect("arg1 entry in Child's resolved view");
+        assert_eq!(
+            arg1.origin.as_ref().map(EntryOrigin::display),
+            Some("pkg_test.Grandparent".to_string())
+        );
     }
 
     #[test]
@@ -2075,6 +4254,293 @@ class Standalone:
         let _ = diagnostics;
         // Left completely untouched -- no panic, no corrupted splice.
         assert_eq!(output, source);
+    }
+
+    #[test]
+    fn a_comma_grouped_shared_entry_does_not_trigger_a_spurious_bailout_or_get_duplicated() {
+        // Real-world regression (found against SimPEG's `regularization/sparse.py`, `Sparse`
+        // class): `numpydoc`'s `nameA, nameB : shared type` syntax gives every comma-separated
+        // name the *exact same* on-disk range (`parse_section` inserts one `ParamEntry` per
+        // name, but all pointing at the one shared line) -- `primary_block_span`'s "entries
+        // aren't in monotonic text order" bail-out guard (added for the genuinely-malformed
+        // duplicate-name case above) was treating that legitimate tie as an inversion too,
+        // bailing out of the whole-block rebuild entirely. That turned a real SimPEG symptom
+        // into "the docstring has no Parameters section to insert into" (`DOC010`) for an
+        // unrelated, genuinely-insertable inherited parameter (`objfcts`) elsewhere in the same
+        // class, even though the class plainly has a well-formed `Parameters` section.
+        let source = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    extra : int
+        Extra doc, from Base.
+    \"\"\"
+
+    def __init__(self, extra=None):
+        pass
+
+
+class Child(Base):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    alpha_x, alpha_y, alpha_z : float, optional
+        Shared scaling constants.
+    \"\"\"
+
+    def __init__(self, alpha_x=1.0, alpha_y=1.0, alpha_z=1.0, extra=None):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        // The comma-group's shared text must appear exactly once, not once per name in the group
+        // (the bug this guards: naively rebuilding per-name would triple it).
+        assert_eq!(
+            child.matches("alpha_x, alpha_y, alpha_z : float, optional").count(),
+            1,
+            "comma-group text duplicated:\n{child}"
+        );
+        // The genuinely inherited-but-locally-undocumented `extra` must now be correctly
+        // inserted, not left as a DOC010 diagnostic-only gap.
+        assert!(child.contains("extra : int\n        Extra doc, from Base."), "got:\n{child}");
+    }
+
+    #[test]
+    fn a_trailing_example_singular_section_no_longer_blocks_the_whole_docstring_from_resyncing() {
+        // Real-world regression (found against SimPEG's `electromagnetics/time_domain/fields.py`,
+        // `FieldsTDEM` class): a `Parameters` section followed by an `Example` (singular, not the
+        // canonical `Examples`) heading swallowed the entire rest of the docstring -- including a
+        // second `.. code-block:: python` line colliding on the same synthesized "name" as an
+        // earlier one -- as bogus entries, corrupting `parse_section`'s ordering invariant and
+        // silently leaving the *whole* docstring untouched (no crash, no diagnostic -- just quietly
+        // never resyncing `simulation`'s stale local text). Root-caused and fixed in
+        // `numpydoc::find_sections` (an unrecognized-but-header-shaped line now still ends the
+        // section before it); this is the end-to-end proof the actual reported symptom is gone.
+        let source = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    simulation : simpeg.simulation.BaseTimeSimulation
+        The simulation object used to compute the discrete field solution.
+    \"\"\"
+
+    def __init__(self, simulation):
+        pass
+
+
+class Child(Base):
+    r\"\"\"Child.
+
+    Parameters
+    ----------
+    simulation : simpeg.child.SomeSimulation
+        Stale, locally-authored text that should resync from Base.
+
+    Example
+    -------
+    Some prose.
+
+    .. code-block:: python
+
+        x = 1
+
+    more prose
+
+    .. code-block:: python
+
+        y = 2
+    \"\"\"
+
+    def __init__(self, simulation):
+        pass
+";
+        let (output, diagnostics) = sync(source);
+        let codes: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec!["DOC015"], "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(
+            child.contains("simulation : simpeg.simulation.BaseTimeSimulation\n        The simulation object used to compute the discrete field solution."),
+            "got:\n{child}"
+        );
+        assert!(!child.contains("Stale, locally-authored text"), "got:\n{child}");
+    }
+
+    const BASE_WITH_ALPHA_COMMA_GROUP_PY: &str = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    alpha_x, alpha_y, alpha_z : float or None, optional
+        Scaling constants for the first order smoothness along x, y and z, respectively.
+        If set to ``None``, the scaling constant is set automatically according to the
+        value of the `length_scale` parameter.
+    \"\"\"
+
+    def __init__(self, alpha_x=None, alpha_y=None, alpha_z=None):
+        pass
+";
+
+    fn child_inheriting_alpha_group(child_docstring: &str) -> String {
+        format!(
+            "{BASE_WITH_ALPHA_COMMA_GROUP_PY}\n\nclass Child(Base):\n    \"\"\"Child.\n\n\
+             {child_docstring}    \"\"\"\n\n    def __init__(self, alpha_x=None, alpha_y=None, alpha_z=None):\n        pass\n"
+        )
+    }
+
+    #[test]
+    fn merge_shared_parameters_off_by_default_splits_inherited_comma_group_entries() {
+        let source = child_inheriting_alpha_group("    Parameters\n    ----------\n    alpha_x : float\n        Stale.\n\n");
+        let (output, diagnostics) = sync(&source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        let expected = "\
+    Parameters
+    ----------
+    alpha_x : float or None, optional
+        Scaling constants for the first order smoothness along x, y and z, respectively.
+        If set to ``None``, the scaling constant is set automatically according to the
+        value of the `length_scale` parameter.
+    alpha_y : float or None, optional
+        Scaling constants for the first order smoothness along x, y and z, respectively.
+        If set to ``None``, the scaling constant is set automatically according to the
+        value of the `length_scale` parameter.
+    alpha_z : float or None, optional
+        Scaling constants for the first order smoothness along x, y and z, respectively.
+        If set to ``None``, the scaling constant is set automatically according to the
+        value of the `length_scale` parameter.
+
+    \"\"\"";
+        assert!(child.contains(expected), "got:\n{child}");
+    }
+
+    #[test]
+    fn merge_shared_parameters_on_recombines_identical_inherited_entries_into_one_line() {
+        let source = child_inheriting_alpha_group("    Parameters\n    ----------\n    alpha_x : float\n        Stale.\n\n");
+        let (output, diagnostics) = sync_merging_shared_parameters(&source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        let expected = "\
+    Parameters
+    ----------
+    alpha_x, alpha_y, alpha_z : float or None, optional
+        Scaling constants for the first order smoothness along x, y and z, respectively.
+        If set to ``None``, the scaling constant is set automatically according to the
+        value of the `length_scale` parameter.
+
+    \"\"\"";
+        assert!(child.contains(expected), "got:\n{child}");
+    }
+
+    #[test]
+    fn merge_shared_parameters_is_idempotent_on_rerun() {
+        let source = child_inheriting_alpha_group("    Parameters\n    ----------\n    alpha_x : float\n        Stale.\n\n");
+        let (first_pass, diagnostics) = sync_merging_shared_parameters(&source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let (second_pass, diagnostics) = sync_merging_shared_parameters(&first_pass);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        assert_eq!(first_pass, second_pass, "a second run must not change anything further");
+    }
+
+    #[test]
+    fn merge_shared_parameters_never_merges_entries_from_different_origins() {
+        // Textually identical descriptions, but documented by two different ancestors --
+        // merging them would misattribute one name's documentation to the wrong origin, so this
+        // must never merge even with the option on. `arg1` reaches `Child` by pure pass-through
+        // from `Grandparent` (never redocumented by `Parent`); `arg2` is `Parent`'s own.
+        let source = "\
+class Grandparent:
+    \"\"\"Grandparent.
+
+    Parameters
+    ----------
+    arg1 : float
+        Shared-looking text.
+    \"\"\"
+
+    def __init__(self, arg1=None):
+        pass
+
+
+class Parent(Grandparent):
+    \"\"\"Parent.
+
+    Parameters
+    ----------
+    arg2 : float
+        Shared-looking text.
+    \"\"\"
+
+    def __init__(self, arg1=None, arg2=None):
+        pass
+
+
+class Child(Parent):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    arg1 : float
+        Stale.
+    \"\"\"
+
+    def __init__(self, arg1=None, arg2=None):
+        pass
+";
+        let (output, diagnostics) = sync_merging_shared_parameters(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        assert!(!child.contains("arg1, arg2"), "must not merge across different origins:\n{child}");
+        assert!(child.contains("arg1 : float\n        Shared-looking text.\n    arg2 : float\n        Shared-looking text."), "got:\n{child}");
+    }
+
+    #[test]
+    fn merge_shared_parameters_never_touches_locally_authored_or_overridden_entries() {
+        let source = "\
+class Base:
+    \"\"\"Base.
+
+    Parameters
+    ----------
+    alpha_x, alpha_y, alpha_z : float or None, optional
+        Scaling constants.
+    \"\"\"
+
+    def __init__(self, alpha_x=None, alpha_y=None, alpha_z=None):
+        pass
+
+
+
+# docerator: override=alpha_y
+class Child(Base):
+    \"\"\"Child.
+
+    Parameters
+    ----------
+    alpha_x : float
+        Placeholder.
+    alpha_y : float
+        Authored locally, must survive untouched.
+    alpha_z : float
+        Placeholder.
+    \"\"\"
+
+    def __init__(self, alpha_x=None, alpha_y=None, alpha_z=None):
+        pass
+";
+        let (output, diagnostics) = sync_merging_shared_parameters(source);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let child = &output[output.find("class Child").unwrap()..];
+        // alpha_y is overridden (authored) -- it must never be folded into a merged group with
+        // its ancestor-managed neighbors, even though its text happens to sit between them.
+        assert!(child.contains("alpha_y : float\n        Authored locally, must survive untouched."), "got:\n{child}");
+        assert!(!child.contains("alpha_x, alpha_y"), "an overridden entry must never be merged:\n{child}");
     }
 
     #[test]

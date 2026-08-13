@@ -30,9 +30,10 @@ use ruff_text_size::{TextRange, TextSize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::style::{Diagnostic, ParamEntry, Severity};
+use crate::provenance::ProvenanceMode;
+use crate::style::{Diagnostic, EntryOrigin, ParamEntry, Severity};
 
-pub const CACHE_FORMAT_VERSION: u32 = 2;
+pub const CACHE_FORMAT_VERSION: u32 = 4;
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub type MethodViews = IndexMap<String, IndexMap<String, ParamEntry>>;
@@ -61,6 +62,13 @@ pub struct CachedFile {
     pub diagnostics: Vec<CachedDiagnostic>,
     /// Per class name in this file, its resolved authored+inherited view.
     pub classes: HashMap<String, CachedMethodViews>,
+    /// Per class name in this file, its own *local* contribution only (never pass-through
+    /// inheritance) — what a descendant elsewhere in the project's MRO needs when this file is
+    /// cache-valid and `resolve_and_rewrite` never actually revisits it this run. Without this,
+    /// a cache hit would silently drop that class's contribution to any descendant reached
+    /// through multiple inheritance (the class's own per-method loop, which is what computes
+    /// this, never runs on a cache hit).
+    pub local_authored: HashMap<String, CachedMethodViews>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +101,16 @@ pub struct CachedParamEntry {
     /// ever matter -- `#[serde(default)]` here is just defensive, not load-bearing.
     #[serde(default)]
     pub is_raw: bool,
+    /// Same rationale as `is_raw`'s comment above -- defensive-only `#[serde(default)]`, backed
+    /// by the `CACHE_FORMAT_VERSION` bump that shipped alongside this field.
+    #[serde(default)]
+    pub origin: Option<CachedEntryOrigin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedEntryOrigin {
+    pub module: String,
+    pub class_name: String,
 }
 
 pub fn hash_text(text: &str) -> String {
@@ -101,13 +119,25 @@ pub fn hash_text(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn compute_global_key(project_default_style: Option<&str>, insert_missing_sections: bool, module_names: &[String]) -> String {
+pub fn compute_global_key(
+    project_default_style: Option<&str>,
+    insert_missing_sections: bool,
+    provenance_mode: ProvenanceMode,
+    merge_shared_parameters: bool,
+    module_names: &[String],
+) -> String {
     let mut sorted: Vec<&str> = module_names.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     let mut hasher = Sha256::new();
     hasher.update(project_default_style.unwrap_or("").as_bytes());
     hasher.update([0u8]);
     hasher.update([insert_missing_sections as u8]);
+    hasher.update([match provenance_mode {
+        ProvenanceMode::Off => 0u8,
+        ProvenanceMode::Comment => 1u8,
+        ProvenanceMode::Inline => 2u8,
+    }]);
+    hasher.update([merge_shared_parameters as u8]);
     for name in sorted {
         hasher.update(name.as_bytes());
         hasher.update([0u8]);
@@ -173,6 +203,7 @@ pub fn param_entry_to_cached(entry: &ParamEntry) -> CachedParamEntry {
         range_start: entry.range.start().into(),
         range_end: entry.range.end().into(),
         is_raw: entry.is_raw,
+        origin: entry.origin.as_ref().map(entry_origin_to_cached),
     }
 }
 
@@ -183,6 +214,21 @@ pub fn cached_to_param_entry(cached: &CachedParamEntry) -> ParamEntry {
         description: cached.description.clone(),
         range: TextRange::new(TextSize::from(cached.range_start), TextSize::from(cached.range_end)),
         is_raw: cached.is_raw,
+        origin: cached.origin.as_ref().map(cached_to_entry_origin),
+    }
+}
+
+fn entry_origin_to_cached(origin: &EntryOrigin) -> CachedEntryOrigin {
+    CachedEntryOrigin {
+        module: origin.module.clone(),
+        class_name: origin.class_name.clone(),
+    }
+}
+
+fn cached_to_entry_origin(cached: &CachedEntryOrigin) -> EntryOrigin {
+    EntryOrigin {
+        module: cached.module.clone(),
+        class_name: cached.class_name.clone(),
     }
 }
 
@@ -220,24 +266,42 @@ mod tests {
 
     #[test]
     fn global_key_ignores_module_order() {
-        let a = compute_global_key(Some("numpydoc"), false, &["pkg.a".to_string(), "pkg.b".to_string()]);
-        let b = compute_global_key(Some("numpydoc"), false, &["pkg.b".to_string(), "pkg.a".to_string()]);
+        let a = compute_global_key(Some("numpydoc"), false, ProvenanceMode::Comment, false, &["pkg.a".to_string(), "pkg.b".to_string()]);
+        let b = compute_global_key(Some("numpydoc"), false, ProvenanceMode::Comment, false, &["pkg.b".to_string(), "pkg.a".to_string()]);
         assert_eq!(a, b);
     }
 
     #[test]
     fn global_key_is_sensitive_to_style_and_module_set() {
-        let base = compute_global_key(Some("numpydoc"), false, &["pkg.a".to_string()]);
-        let different_style = compute_global_key(Some("google"), false, &["pkg.a".to_string()]);
-        let different_modules = compute_global_key(Some("numpydoc"), false, &["pkg.a".to_string(), "pkg.b".to_string()]);
+        let base = compute_global_key(Some("numpydoc"), false, ProvenanceMode::Comment, false, &["pkg.a".to_string()]);
+        let different_style = compute_global_key(Some("google"), false, ProvenanceMode::Comment, false, &["pkg.a".to_string()]);
+        let different_modules =
+            compute_global_key(Some("numpydoc"), false, ProvenanceMode::Comment, false, &["pkg.a".to_string(), "pkg.b".to_string()]);
         assert_ne!(base, different_style);
         assert_ne!(base, different_modules);
     }
 
     #[test]
     fn global_key_is_sensitive_to_insert_missing_sections() {
-        let off = compute_global_key(Some("numpydoc"), false, &["pkg.a".to_string()]);
-        let on = compute_global_key(Some("numpydoc"), true, &["pkg.a".to_string()]);
+        let off = compute_global_key(Some("numpydoc"), false, ProvenanceMode::Comment, false, &["pkg.a".to_string()]);
+        let on = compute_global_key(Some("numpydoc"), true, ProvenanceMode::Comment, false, &["pkg.a".to_string()]);
+        assert_ne!(off, on);
+    }
+
+    #[test]
+    fn global_key_is_sensitive_to_provenance_mode() {
+        let comment = compute_global_key(Some("numpydoc"), false, ProvenanceMode::Comment, false, &["pkg.a".to_string()]);
+        let inline = compute_global_key(Some("numpydoc"), false, ProvenanceMode::Inline, false, &["pkg.a".to_string()]);
+        let off = compute_global_key(Some("numpydoc"), false, ProvenanceMode::Off, false, &["pkg.a".to_string()]);
+        assert_ne!(comment, inline);
+        assert_ne!(comment, off);
+        assert_ne!(inline, off);
+    }
+
+    #[test]
+    fn global_key_is_sensitive_to_merge_shared_parameters() {
+        let off = compute_global_key(Some("numpydoc"), false, ProvenanceMode::Comment, false, &["pkg.a".to_string()]);
+        let on = compute_global_key(Some("numpydoc"), false, ProvenanceMode::Comment, true, &["pkg.a".to_string()]);
         assert_ne!(off, on);
     }
 
@@ -273,6 +337,10 @@ mod tests {
             description: Some("desc".to_string()),
             range: TextRange::new(TextSize::from(0), TextSize::from(10)),
             is_raw: true,
+            origin: Some(EntryOrigin {
+                module: "pkg.base".to_string(),
+                class_name: "Base".to_string(),
+            }),
         };
         let cached = param_entry_to_cached(&original);
         let restored = cached_to_param_entry(&cached);

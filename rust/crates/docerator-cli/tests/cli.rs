@@ -396,3 +396,119 @@ fn insert_missing_sections_flag_synthesizes_the_section_via_fix() {
         .code(0)
         .stdout(predicate::str::contains("0 files would change"));
 }
+
+#[test]
+fn provenance_defaults_to_comment_mode_without_any_flag_or_config() {
+    let dir = write_project();
+
+    Command::cargo_bin("docerator").unwrap().args(["--fix"]).arg(dir.path()).assert().code(1);
+
+    let child_text = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(child_text.contains("# docerator: provenance"));
+    assert!(child_text.contains("# docerator: from pkg.base.Base: arg1"));
+}
+
+#[test]
+fn provenance_off_flag_suppresses_the_comment_block() {
+    let dir = write_project();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--fix", "--provenance", "off"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    let child_text = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(!child_text.contains("docerator: provenance"));
+}
+
+#[test]
+fn provenance_inline_flag_appends_notes_into_descriptions() {
+    let dir = write_project();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--fix", "--provenance", "inline"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    let child_text = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(!child_text.contains("docerator: provenance"));
+    assert!(child_text.contains("(Inherited from pkg.base.Base.)"));
+}
+
+#[test]
+fn pyproject_provenance_setting_is_honored_without_any_cli_flag() {
+    let dir = write_project();
+    fs::write(dir.path().join("pyproject.toml"), "[tool.docerator]\nprovenance = \"off\"\n").unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .args(["--fix"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    let child_text = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(!child_text.contains("docerator: provenance"));
+}
+
+#[test]
+fn cli_provenance_flag_overrides_a_conflicting_pyproject_setting() {
+    let dir = write_project();
+    fs::write(dir.path().join("pyproject.toml"), "[tool.docerator]\nprovenance = \"off\"\n").unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .args(["--fix", "--provenance", "comment"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    let child_text = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(child_text.contains("# docerator: provenance"));
+}
+
+#[test]
+fn invalid_pyproject_provenance_value_warns_on_stderr_and_falls_back_to_comment_default() {
+    let dir = write_project();
+    fs::write(dir.path().join("pyproject.toml"), "[tool.docerator]\nprovenance = \"bogus\"\n").unwrap();
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--project-root"])
+        .arg(dir.path())
+        .args(["--fix"])
+        .arg(dir.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("bogus").and(predicate::str::contains("not a valid provenance mode")));
+
+    let child_text = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(child_text.contains("# docerator: provenance"), "should fall back to the Comment default");
+}
+
+#[test]
+fn switching_provenance_mode_between_runs_invalidates_the_cache_and_regenerates() {
+    let dir = write_project();
+
+    Command::cargo_bin("docerator").unwrap().args(["--fix"]).arg(dir.path()).assert().code(1);
+    let after_comment = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(after_comment.contains("docerator: provenance"));
+
+    Command::cargo_bin("docerator")
+        .unwrap()
+        .args(["--fix", "--provenance", "inline"])
+        .arg(dir.path())
+        .assert()
+        .code(1);
+    let after_inline = fs::read_to_string(dir.path().join("pkg/child.py")).unwrap();
+    assert!(!after_inline.contains("docerator: provenance"), "a stale cache must not serve the old comment-mode output");
+    assert!(after_inline.contains("(Inherited from pkg.base.Base.)"));
+}

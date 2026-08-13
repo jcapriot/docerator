@@ -6,6 +6,7 @@ pub mod location;
 pub mod model;
 pub mod parse;
 pub mod project;
+pub mod provenance;
 pub mod source;
 pub mod style;
 pub mod sync;

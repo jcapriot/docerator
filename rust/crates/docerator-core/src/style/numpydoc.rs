@@ -52,16 +52,7 @@ impl DocStyle for NumpydocStyle {
         // nesting depth). Re-anchoring a description copied across a *different* indentation
         // context (nested class, nested nesting depth, cross-file) is not implemented yet;
         // `indent` is accepted now so the call sites don't need to change when that lands.
-        let mut out = entry.name.clone();
-        if let Some(ty) = &entry.type_description {
-            out.push_str(" : ");
-            out.push_str(ty);
-        }
-        if let Some(desc) = &entry.description {
-            out.push_str(newline);
-            out.push_str(desc);
-        }
-        out
+        render_entry_text(&entry.name, entry, newline)
     }
 
     fn synthesize_section(&self, section: ParamSectionKind) -> String {
@@ -71,6 +62,23 @@ impl DocStyle for NumpydocStyle {
         };
         format!("{name}\n{}\n", "-".repeat(name.chars().count()))
     }
+}
+
+/// Renders `entry`'s type/description exactly like `format_entry`, but under an explicitly
+/// supplied `name` rather than `entry.name` — the one case that needs this is rendering several
+/// names that share one entry's documentation (`nameA, nameB : shared type`, `merge_shared_
+/// parameters`) back out as a single joined-name line instead of `entry.name` alone.
+pub(crate) fn render_entry_text(name: &str, entry: &ParamEntry, newline: &str) -> String {
+    let mut out = name.to_string();
+    if let Some(ty) = &entry.type_description {
+        out.push_str(" : ");
+        out.push_str(ty);
+    }
+    if let Some(desc) = &entry.description {
+        out.push_str(newline);
+        out.push_str(desc);
+    }
+    out
 }
 
 /// One physical line's content span within the parsed text, terminator excluded (a trailing
@@ -168,9 +176,29 @@ struct SectionBody {
 
 /// Scan for canonically-ordered `<Name>\n<dashes>\n` section headers, returning each
 /// recognized section's body byte range (the text strictly between its underline and the next
-/// recognized header, or end of input for the last one).
+/// header — canonical *or not*, see below — or end of input for the last one).
+///
+/// A line that merely *looks* like a section heading — any at-margin text immediately followed
+/// by an at-margin dash-underline of the exact same length — but isn't one of numpydoc's
+/// canonical names (`Example` instead of `Examples`, `Note` instead of `Notes`, ...) still ends
+/// whatever recognized section precedes it, even though its own content is left unparsed and
+/// unmanaged. Real RST heading recognition (which is what Sphinx/numpydoc-adjacent renderers
+/// actually use to decide "is this a section break") is purely about underline-length matching,
+/// not a fixed vocabulary — a strictly narrower rule here would let an unanticipated heading
+/// spelling get silently swallowed as if it were more of the *previous* section's content. This
+/// was a real, observed SimPEG bug: a `Parameters` section followed by `Example` (singular)
+/// swallowed the entire rest of the docstring — including a second, later `.. code-block::
+/// python` line that collided on the same synthesized "name" as an earlier one — as bogus
+/// parameter entries, corrupting `parse_section`'s "insertion order matches text order"
+/// invariant and silently blocking the whole-block rebuild for the *real* `Parameters` entries
+/// above it (a defensive bail-out elsewhere catches the corruption safely, but the fix belongs
+/// here, at the actual root cause, not just in surviving its symptom).
 fn find_sections(lines: &[Line], source: &str, margin: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec<SectionBody> {
     let mut accepted: Vec<(usize, usize)> = Vec::new(); // (canon_index, header_line_idx)
+    // Every header-shaped line's own index, canonical or not — used only to find where an
+    // accepted section's body actually ends (the next one of *either* kind), never to look
+    // anything up by `canon_index`.
+    let mut all_header_indices: Vec<usize> = Vec::new();
     let mut last_index: Option<usize> = None;
     let mut i = 0usize;
     while i < lines.len() {
@@ -184,6 +212,7 @@ fn find_sections(lines: &[Line], source: &str, margin: usize, diagnostics: &mut 
                         if !next_trimmed.is_empty() && next_trimmed.bytes().all(|b| b == b'-') {
                             let expected_len = SECTIONS[canon_index].chars().count();
                             if next_trimmed.chars().count() == expected_len {
+                                all_header_indices.push(i);
                                 if last_index.is_none_or(|li| canon_index > li) {
                                     accepted.push((canon_index, i));
                                     last_index = Some(canon_index);
@@ -218,6 +247,30 @@ fn find_sections(lines: &[Line], source: &str, margin: usize, diagnostics: &mut 
                         }
                     }
                 }
+            } else if !trimmed.is_empty() {
+                if let Some(next) = lines.get(i + 1) {
+                    if next.indent(source) == margin {
+                        let next_trimmed = &next.text(source)[margin..];
+                        if !next_trimmed.is_empty()
+                            && next_trimmed.bytes().all(|b| b == b'-')
+                            && next_trimmed.chars().count() == trimmed.chars().count()
+                        {
+                            all_header_indices.push(i);
+                            diagnostics.push(Diagnostic {
+                                code: "DOC015",
+                                severity: Severity::Info,
+                                message: format!(
+                                    "'{trimmed}' looks like a section heading but isn't a name numpydoc \
+                                     recognizes; its own content is left unmanaged, though it still ends \
+                                     whatever section precedes it"
+                                ),
+                                range: line_range(line),
+                            });
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
             }
         }
         i += 1;
@@ -231,16 +284,16 @@ fn find_sections(lines: &[Line], source: &str, margin: usize, diagnostics: &mut 
     let trimmed_end = source.trim_end().len();
 
     let mut sections = Vec::with_capacity(accepted.len());
-    for (idx, &(canon_index, header_idx)) in accepted.iter().enumerate() {
+    for &(canon_index, header_idx) in &accepted {
         let body_start = lines
             .get(header_idx + 2)
             .map(|l| l.start)
             .unwrap_or(lines[header_idx + 1].end);
-        let body_end = if idx + 1 < accepted.len() {
-            lines[accepted[idx + 1].1].start.saturating_sub(1)
-        } else {
-            trimmed_end
-        };
+        let body_end = all_header_indices
+            .iter()
+            .find(|&&idx| idx > header_idx)
+            .map(|&idx| lines[idx].start.saturating_sub(1))
+            .unwrap_or(trimmed_end);
         sections.push(SectionBody {
             canon_index,
             header_start: lines[header_idx].start,
@@ -289,10 +342,51 @@ fn split_name_type(content: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Given an arg-line and the byte offset marking where its own description search should stop
+/// (either the next arg-line's own start, or the section's own end), returns its trimmed
+/// description text (if any non-blank content follows) and the true end offset of the line's own
+/// block — either the line's own end (no description, or a blank one) or the end of its trimmed
+/// description text. Shared by real-entry range computation and the untracked `*args`/`**kwargs`
+/// tail computation below, so both compute byte-identical boundaries.
+///
+/// Trims only trailing whitespace, never leading: an author-written blank line between the
+/// `name : type` line and the description is part of that entry's own authored formatting and
+/// must be preserved verbatim so it's reproduced faithfully wherever this entry gets auto-synced
+/// — it is NOT the tool's place to normalize an author's spacing choice within their own content.
+/// Trailing whitespace is different: it's never really "this entry's content" at all, it's the
+/// gap before whatever comes next (another parameter, or — for the last entry in a section
+/// immediately followed by another section — the next section's header, picked up as one
+/// incidental trailing newline by the same slicing rule that correctly excludes the header text
+/// itself). Stopping at the end of the last real content line, however many blank lines follow,
+/// means splicing never reaches into that trailing gap at all.
+fn line_description_and_end(source: &str, line: &Line, raw_desc_end: usize) -> (Option<String>, usize) {
+    let desc_start = next_line_start(source, line.end);
+    if desc_start < raw_desc_end {
+        let trimmed = source[desc_start..raw_desc_end].trim_end();
+        if trimmed.is_empty() {
+            (None, line.end)
+        } else {
+            (Some(trimmed.to_string()), desc_start + trimmed.len())
+        }
+    } else {
+        (None, line.end)
+    }
+}
+
 /// Parse one section's own body in isolation — every boundary (the "next arg line", the
 /// fallback end-of-description) stays within this section's own `body_end`, so `Parameters`
 /// and `Other Parameters` can always be parsed independently with no cross-section bleed.
-fn parse_section(lines: &[Line], source: &str, section: &SectionBody, margin: usize) -> IndexMap<String, ParamEntry> {
+///
+/// Returns the real, named entries plus the byte range of a trailing `*args`/`**kwargs` run, if
+/// the section's own last arg-line is star-prefixed — see `ParsedEntries::primary_trailing_var_args`
+/// for why that position (never its content) is tracked separately rather than folded into
+/// `entries` itself.
+fn parse_section(
+    lines: &[Line],
+    source: &str,
+    section: &SectionBody,
+    margin: usize,
+) -> (IndexMap<String, ParamEntry>, Option<TextRange>) {
     let mut arg_line_indices: Vec<usize> = Vec::new();
     collect_arg_lines(lines, source, section.body_start, section.body_end, margin, &mut arg_line_indices);
 
@@ -307,37 +401,11 @@ fn parse_section(lines: &[Line], source: &str, section: &SectionBody, margin: us
         }
         let (raw_names, type_desc) = split_name_type(content);
 
-        let desc_start = next_line_start(source, line.end);
         let raw_desc_end = match arg_line_indices.get(pos + 1) {
             Some(&next_idx) => lines[next_idx].start.saturating_sub(1).min(section.body_end),
             None => section.body_end,
         };
-
-        // Trim only trailing whitespace, never leading: an author-written blank line between
-        // the `name : type` line and the description is part of that entry's own authored
-        // formatting and must be preserved verbatim so it's reproduced faithfully wherever this
-        // entry gets auto-synced — it is NOT the tool's place to normalize an author's spacing
-        // choice within their own content. Trailing whitespace is different: it's never really
-        // "this entry's content" at all, it's the gap before whatever comes next (another
-        // parameter, or — for the last entry in a section immediately followed by another
-        // section — the next section's header, picked up as one incidental trailing newline by
-        // the same slicing rule that correctly excludes the header text itself). Stopping the
-        // range at the end of the last real content line, however many blank lines follow,
-        // means splicing never reaches into that trailing gap at all — so whatever spacing
-        // already exists at the splice *target* (zero blank lines or several) is left
-        // completely untouched, never stripped and never padded, matching "keep what's there,
-        // insert nothing of your own." Interior blank lines (a genuine multi-paragraph
-        // description) are untouched either way since trimming only ever shortens from one end.
-        let (description, desc_end) = if desc_start < raw_desc_end {
-            let trimmed = source[desc_start..raw_desc_end].trim_end();
-            if trimmed.is_empty() {
-                (None, line.end)
-            } else {
-                (Some(trimmed.to_string()), desc_start + trimmed.len())
-            }
-        } else {
-            (None, line.end)
-        };
+        let (description, desc_end) = line_description_and_end(source, line, raw_desc_end);
 
         // Range starts *after* the line's leading margin indentation, not at the line start —
         // the indentation is untouched surrounding text, not part of the entry's own content,
@@ -355,14 +423,42 @@ fn parse_section(lines: &[Line], source: &str, section: &SectionBody, margin: us
                     type_description: type_desc.map(str::to_string),
                     description: description.clone(),
                     range: entry_range,
-                    // Stamped in by the caller via `ParsedEntries::set_is_raw` once the source
-                    // docstring's raw-ness is known -- parsing itself is style-agnostic.
+                    // Stamped in by the caller via `ParsedEntries::set_is_raw`/`set_origin` once
+                    // known -- parsing itself is style-agnostic.
                     is_raw: false,
+                    origin: None,
                 },
             );
         }
     }
-    entries
+
+    // A trailing run of star-prefixed arg-lines (`*args`, `**kwargs`, or both) at the section's
+    // own tail — tracked only if the section's truly-last arg-line is itself star-prefixed;
+    // *args/**kwargs appearing anywhere else (not last) is unusual enough to just leave
+    // unanchored, same as today.
+    let trailing_var_args = arg_line_indices.last().and_then(|&last_idx| {
+        let last_line = &lines[last_idx];
+        if !last_line.text(source)[margin..].starts_with('*') {
+            return None;
+        }
+        let mut run_start_pos = arg_line_indices.len() - 1;
+        while run_start_pos > 0 {
+            let candidate_idx = arg_line_indices[run_start_pos - 1];
+            if lines[candidate_idx].text(source)[margin..].starts_with('*') {
+                run_start_pos -= 1;
+            } else {
+                break;
+            }
+        }
+        let run_start_line = &lines[arg_line_indices[run_start_pos]];
+        let (_, last_end) = line_description_and_end(source, last_line, section.body_end);
+        Some(TextRange::new(
+            TextSize::try_from(run_start_line.start + margin).unwrap(),
+            TextSize::try_from(last_end.max(last_line.end)).unwrap(),
+        ))
+    });
+
+    (entries, trailing_var_args)
 }
 
 fn parse_entries(source: &str) -> (ParsedEntries, Vec<Diagnostic>) {
@@ -374,15 +470,15 @@ fn parse_entries(source: &str) -> (ParsedEntries, Vec<Diagnostic>) {
     let params_section = sections.iter().find(|s| s.canon_index == PARAMETERS_INDEX);
     let others_section = sections.iter().find(|s| s.canon_index == OTHER_PARAMETERS_INDEX);
 
-    let primary = params_section
+    let (primary, primary_trailing_var_args) = params_section
         .map(|s| parse_section(&lines, source, s, margin))
         .unwrap_or_default();
-    let secondary = others_section
+    let (secondary, secondary_trailing_var_args) = others_section
         .map(|s| parse_section(&lines, source, s, margin))
         .unwrap_or_default();
 
     if let Some(s) = params_section {
-        if primary.is_empty() {
+        if primary.is_empty() && primary_trailing_var_args.is_none() {
             diagnostics.push(Diagnostic {
                 code: "DOC005",
                 severity: Severity::Warning,
@@ -409,6 +505,9 @@ fn parse_entries(source: &str) -> (ParsedEntries, Vec<Diagnostic>) {
             // is the textually-first recognized section, regardless of its own kind.
             first_section_start: sections.first().map(|s| s.header_start),
             margin_indent: " ".repeat(margin),
+            secondary_header_start: others_section.map(|s| s.header_start),
+            primary_trailing_var_args,
+            secondary_trailing_var_args,
         },
         diagnostics,
     )
@@ -484,6 +583,60 @@ mod tests {
         let doc = "Summary\n\nParameters\n----------\nreal_arg : int\n    Documented.\n*args\n**kwargs\n";
         let (parsed, _diagnostics) = parse_entries(doc);
         assert_eq!(entry_names(&parsed), vec!["real_arg"]);
+    }
+
+    #[test]
+    fn trailing_kwargs_only_line_is_tracked_but_not_an_entry() {
+        let doc = "Summary\n\nParameters\n----------\nreal_arg : int\n    Documented.\n**kwargs\n";
+        let (parsed, _diagnostics) = parse_entries(doc);
+        assert_eq!(entry_names(&parsed), vec!["real_arg"]);
+        let range = parsed.primary_trailing_var_args.expect("trailing kwargs should be tracked");
+        assert_eq!(&doc[range], "**kwargs");
+        assert!(parsed.secondary_trailing_var_args.is_none());
+    }
+
+    #[test]
+    fn trailing_kwargs_with_multiline_description_is_tracked_to_its_true_end() {
+        let doc = "Summary\n\nParameters\n----------\nreal_arg : int\n    Documented.\n**kwargs\n    Forwarded.\n    Second line.\n\nNotes\n-----\nSome notes.\n";
+        let (parsed, _diagnostics) = parse_entries(doc);
+        assert_eq!(entry_names(&parsed), vec!["real_arg"]);
+        let range = parsed.primary_trailing_var_args.expect("trailing kwargs should be tracked");
+        assert_eq!(&doc[range], "**kwargs\n    Forwarded.\n    Second line.");
+    }
+
+    #[test]
+    fn trailing_args_and_kwargs_both_present_are_tracked_as_one_run() {
+        let doc = "Summary\n\nParameters\n----------\nreal_arg : int\n    Documented.\n*args\n    Extra positional.\n**kwargs\n    Extra keyword.\n";
+        let (parsed, _diagnostics) = parse_entries(doc);
+        assert_eq!(entry_names(&parsed), vec!["real_arg"]);
+        let range = parsed.primary_trailing_var_args.expect("trailing run should be tracked");
+        assert_eq!(&doc[range], "*args\n    Extra positional.\n**kwargs\n    Extra keyword.");
+    }
+
+    #[test]
+    fn non_trailing_star_line_is_not_tracked() {
+        let doc = "Summary\n\nParameters\n----------\n*args\n    Extra positional.\nreal_arg : int\n    Documented.\n";
+        let (parsed, _diagnostics) = parse_entries(doc);
+        assert_eq!(entry_names(&parsed), vec!["real_arg"]);
+        assert!(parsed.primary_trailing_var_args.is_none());
+    }
+
+    #[test]
+    fn other_parameters_trailing_kwargs_is_tracked_independently_of_parameters() {
+        let doc = "Summary\n\nParameters\n----------\nreal_arg : int\n    Documented.\n\nOther Parameters\n----------------\nextra : bool\n    Extra.\n**kwargs\n    Forwarded.\n";
+        let (parsed, _diagnostics) = parse_entries(doc);
+        assert!(parsed.primary_trailing_var_args.is_none());
+        let range = parsed.secondary_trailing_var_args.expect("secondary trailing kwargs should be tracked");
+        assert_eq!(&doc[range], "**kwargs\n    Forwarded.");
+    }
+
+    #[test]
+    fn parameters_section_of_only_kwargs_does_not_raise_doc005() {
+        let doc = "Summary\n\nParameters\n----------\n**kwargs\n    Forwarded.\n";
+        let (parsed, diagnostics) = parse_entries(doc);
+        assert!(diagnostics.is_empty(), "expected no diagnostics, got {diagnostics:?}");
+        assert!(parsed.primary.is_empty());
+        assert!(parsed.primary_trailing_var_args.is_some());
     }
 
     #[test]
@@ -613,6 +766,29 @@ mod tests {
         assert_eq!(body_text("Examples"), Some("item"));
         assert_eq!(body_text("Methods"), None);
         assert_eq!(body_text("Returns"), None);
+    }
+
+    #[test]
+    fn an_unrecognized_but_header_shaped_line_still_terminates_the_preceding_section() {
+        // Real-world regression (found against SimPEG's `time_domain/fields.py`, `FieldsTDEM`
+        // class): `Example` (singular) isn't a canonical numpydoc section name -- only the
+        // plural `Examples` is -- so without this fix, everything after it (including a second,
+        // later `.. code-block:: python` line colliding on the same synthesized "name" as an
+        // earlier one) got swallowed as bogus entries into the *preceding* `Parameters` section,
+        // corrupting its "insertion order matches text order" invariant and silently blocking
+        // the whole-block rebuild for the docstring's real entries.
+        let doc = "Summary\n\nParameters\n----------\narg1 : int\n    Doc.\n\nExample\n-------\nSome prose.\n\n.. code-block:: python\n\n    x = 1\n\nmore prose\n\n.. code-block:: python\n\n    y = 2\n";
+        let (parsed, diagnostics) = parse_entries(doc);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "DOC015");
+        assert_eq!(entry_names(&parsed), vec!["arg1"]);
+    }
+
+    #[test]
+    fn a_recognized_canonical_header_is_not_double_diagnosed_as_unrecognized() {
+        let doc = "Summary\n\nParameters\n----------\narg1 : int\n    Doc.\n\nReturns\n-------\nsomething\n";
+        let (_parsed, diagnostics) = parse_entries(doc);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
     }
 
     #[test]

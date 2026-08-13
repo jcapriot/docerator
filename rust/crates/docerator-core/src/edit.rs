@@ -19,11 +19,20 @@ impl TextEdit {
 /// Apply a set of non-overlapping edits to `source` in one pass, splicing at each edit's
 /// original byte range. Panics if edits overlap — callers are expected to guarantee this by
 /// construction (distinct docstring entries never share a byte range).
+///
+/// Sorted by `(start, end)`, not `start` alone: a zero-width insert and a real (non-empty) range
+/// that both begin at the same offset are allowed to *touch* (the overlap check below is `<=`,
+/// not `<`), but only in one order — the insert must land before the range that starts there, not
+/// after. Keying on `start` alone leaves that order to `sort_by_key`'s tie-breaking, which is
+/// stable (preserves whichever order the caller happened to push them in) — correct only by
+/// accident, and silently wrong (a spurious panic) the moment two independent edit-emitting code
+/// paths push such a pair in the other order. Ordering shorter ranges first at a shared start
+/// makes the zero-width case sort correctly regardless of push order.
 pub fn apply_edits(source: &str, mut edits: Vec<TextEdit>) -> String {
     if edits.is_empty() {
         return source.to_string();
     }
-    edits.sort_by_key(|e| e.range.start());
+    edits.sort_by_key(|e| (e.range.start(), e.range.end()));
     for pair in edits.windows(2) {
         assert!(
             pair[0].range.end() <= pair[1].range.start(),
@@ -87,5 +96,24 @@ mod tests {
             TextEdit::new(range(3, 8), "b"),
         ];
         apply_edits(source, edits);
+    }
+
+    #[test]
+    fn a_zero_width_insert_and_a_range_starting_at_the_same_offset_do_not_panic_regardless_of_push_order() {
+        // Regression: sorting by `start` alone leaves the relative order of a same-start pair to
+        // `sort_by_key`'s tie-breaking (stable — whichever push order the caller happened to use)
+        // instead of the only order that's actually valid here (the zero-width insert has to land
+        // *before* the range that starts there, not after) — real callers push these from two
+        // independent code paths with no coordination between them, so relying on push order is
+        // fragile. Both push orders must produce the identical, correct result.
+        let source = "hello world";
+        let insert = TextEdit::new(range(5, 5), "!");
+        let delete = TextEdit::new(range(5, 11), "");
+
+        let insert_pushed_first = apply_edits(source, vec![insert.clone(), delete.clone()]);
+        let delete_pushed_first = apply_edits(source, vec![delete, insert]);
+
+        assert_eq!(insert_pushed_first, "hello!");
+        assert_eq!(delete_pushed_first, "hello!");
     }
 }

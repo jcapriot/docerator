@@ -31,6 +31,14 @@ pub struct DoceratorConfig {
     /// sections` on the CLI overrides this when both are given (the CLI flag wins, same
     /// precedent as every other layered setting here).
     pub insert_missing_sections: Option<bool>,
+    /// Mirrors `docerator_core::provenance::ProvenanceMode` — `"off"`, `"comment"`, or `"inline"`.
+    /// Kept as a raw string here (not `ProvenanceMode` directly) and parsed/validated in
+    /// `main.rs`, so an invalid value only warns and falls back rather than failing this whole
+    /// file's config load. `--provenance` on the CLI wins when both are given.
+    pub provenance: Option<String>,
+    /// Mirrors `docerator_core::sync::SyncOptions::merge_shared_parameters` —
+    /// `--merge-shared-parameters` on the CLI overrides this when both are given.
+    pub merge_shared_parameters: Option<bool>,
 }
 
 /// Look for `pyproject.toml` directly inside `project_root` and read its `[tool.docerator]`

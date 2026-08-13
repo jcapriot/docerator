@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
+use docerator_core::provenance::ProvenanceMode;
 use docerator_core::style::Severity;
 use docerator_core::sync::{sync_project_with_cache_and_options, sync_project_with_options, SyncOptions};
 use rules::RuleLevel;
@@ -79,6 +80,20 @@ struct Cli {
     /// `insert_missing_sections` in `[tool.docerator]`; either source turning it on is enough.
     #[arg(long)]
     insert_missing_sections: bool,
+
+    /// Whether (and how) to make an auto-managed parameter's ancestor visible in the source: a
+    /// managed comment block after the docstring, a note inline in the copied text, or neither.
+    /// Defaults to `comment`. Mirrors `provenance` in `[tool.docerator]`; when both are given,
+    /// this flag wins.
+    #[arg(long, value_enum)]
+    provenance: Option<ProvenanceModeArg>,
+
+    /// When several consecutive, auto-managed parameters share identical documentation, render
+    /// them back out as one combined `nameA, nameB : shared type` line instead of duplicating the
+    /// same text once per name. Mirrors `merge_shared_parameters` in `[tool.docerator]`; either
+    /// source turning it on is enough.
+    #[arg(long)]
+    merge_shared_parameters: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -93,6 +108,23 @@ enum ColorChoice {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ProvenanceModeArg {
+    Off,
+    Comment,
+    Inline,
+}
+
+impl ProvenanceModeArg {
+    fn to_core(self) -> ProvenanceMode {
+        match self {
+            ProvenanceModeArg::Off => ProvenanceMode::Off,
+            ProvenanceModeArg::Comment => ProvenanceMode::Comment,
+            ProvenanceModeArg::Inline => ProvenanceMode::Inline,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -138,9 +170,23 @@ fn main() -> ExitCode {
 
     let cache_dir = (!cli.no_cache).then(|| cache_io::resolve_cache_dir(cli.cache_dir.as_deref(), &project_root));
 
+    let provenance_mode = cli
+        .provenance
+        .map(ProvenanceModeArg::to_core)
+        .or_else(|| {
+            project_config.provenance.as_deref().and_then(|s| {
+                s.parse::<ProvenanceMode>()
+                    .inspect_err(|e| eprintln!("warning: [tool.docerator] provenance = {s:?}: {e}, ignoring"))
+                    .ok()
+            })
+        })
+        .unwrap_or_default();
+
     let sync_options = SyncOptions {
         project_default_style: project_config.style.as_deref(),
         insert_missing_sections: cli.insert_missing_sections || project_config.insert_missing_sections.unwrap_or(false),
+        provenance_mode,
+        merge_shared_parameters: cli.merge_shared_parameters || project_config.merge_shared_parameters.unwrap_or(false),
     };
 
     let mut outputs = if let Some(cache_dir) = &cache_dir {

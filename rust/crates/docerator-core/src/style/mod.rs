@@ -3,6 +3,25 @@ pub mod numpydoc;
 use indexmap::IndexMap;
 use ruff_text_size::TextRange;
 
+/// Which ancestor class an entry was originally authored in — a class name plus its fully
+/// qualified module path, since a bare class name alone can be genuinely ambiguous in a real
+/// project (e.g. this codebase's own SimPEG fixtures have a `Data` class in both `simpeg.data`
+/// and `simpeg.electromagnetics.natural_source.survey`). Deliberately its own small type here
+/// rather than reusing `project::ClassId` directly: `project.rs` already depends on `style` (for
+/// `Diagnostic`/`Severity`), so the reverse dependency would be circular. `sync.rs`, which already
+/// depends on both, does the trivial conversion at the one place an entry's origin is stamped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EntryOrigin {
+    pub module: String,
+    pub class_name: String,
+}
+
+impl EntryOrigin {
+    pub fn display(&self) -> String {
+        format!("{}.{}", self.module, self.class_name)
+    }
+}
+
 /// One parsed parameter documentation entry: a name, its optional type description, its
 /// optional long-form description, and the exact byte range of its whole text block (the
 /// `name [: type]` line through its trailing description lines) within the text that was
@@ -19,6 +38,15 @@ pub struct ParamEntry {
     /// entry containing a backslash into a docstring with *different* raw-ness, where the same
     /// bytes would carry different escape semantics.
     pub is_raw: bool,
+    /// Which class this entry was actually authored in. `None` at construction time (parsing is
+    /// style-agnostic and has no notion of which class it's parsing for); stamped in by the
+    /// caller via `ParsedEntries::set_origin`, mirroring `is_raw`. Because `resolve_and_rewrite`
+    /// only ever overwrites an entry when a class genuinely authors or overrides it — never when
+    /// merely passing an ancestor's entry through unmodified — this stamp survives untouched
+    /// through arbitrarily many non-overriding descendants, so it always names the class that
+    /// *really* first documented this parameter, not merely the nearest one that happened to
+    /// resync it.
+    pub origin: Option<EntryOrigin>,
 }
 
 /// The result of parsing one docstring's parameter-documenting section(s), normalized to two
@@ -48,6 +76,26 @@ pub struct ParsedEntries {
     /// synthesized section's own lines need, since there's no existing entry to borrow it from
     /// when the section doesn't exist yet at all.
     pub margin_indent: String,
+    /// Byte offset (relative to the parsed docstring text) of the `Other Parameters` section's
+    /// own header line, if one was found — `None` when there's no such section at all. Needed
+    /// (unlike `Parameters`, which is always managed entry-by-entry or via its own whole-block
+    /// rebuild) because `expand_kwargs` can need to remove the *entire* `Other Parameters`
+    /// section, header included, when every entry in it turns out to be stale (e.g. `expand_
+    /// kwargs=` switched from targeting this section to targeting `Parameters` instead).
+    pub secondary_header_start: Option<usize>,
+    /// Byte range (relative to the parsed docstring text) of the trailing, contiguous run of
+    /// `*args`/`**kwargs` "entries" at the tail of the `Parameters` section body, if its own last
+    /// arg-line is star-prefixed — computed with the same name-line-through-trimmed-description-end
+    /// slicing rules as a real `ParamEntry.range`, but tracked *outside* `primary` on purpose:
+    /// `*args`/`**kwargs` documentation must never become a real `ParamEntry` and flow through the
+    /// ancestor-inheritance / "authored" machinery, since each class's own `**kwargs` prose is
+    /// inherently local (what *that* class forwards, in its own words), never meant to match — or
+    /// be overwritten by — an ancestor's. This field exists purely so insertion-anchoring code can
+    /// see past it. `None` when the section doesn't exist, has no arg-lines, or its own last
+    /// arg-line is an ordinary named parameter.
+    pub primary_trailing_var_args: Option<TextRange>,
+    /// Same as `primary_trailing_var_args`, for the `Other Parameters` section.
+    pub secondary_trailing_var_args: Option<TextRange>,
 }
 
 impl ParsedEntries {
@@ -75,6 +123,15 @@ impl ParsedEntries {
     pub fn set_is_raw(&mut self, is_raw: bool) {
         for entry in self.primary.values_mut().chain(self.secondary.values_mut()) {
             entry.is_raw = is_raw;
+        }
+    }
+
+    /// Stamp every entry's `origin` with the class they were just parsed out of — same rationale
+    /// and calling convention as `set_is_raw`: parsing has no notion of which class it's parsing
+    /// for, so the caller (which does) fills this in right after `parse_entries` returns.
+    pub fn set_origin(&mut self, origin: EntryOrigin) {
+        for entry in self.primary.values_mut().chain(self.secondary.values_mut()) {
+            entry.origin = Some(origin.clone());
         }
     }
 }
@@ -113,6 +170,9 @@ pub const KNOWN_DIAGNOSTIC_CODES: &[(&str, Severity)] = &[
     ("DOC010", Severity::Warning),
     ("DOC011", Severity::Warning),
     ("DOC012", Severity::Error),
+    ("DOC013", Severity::Warning),
+    ("DOC014", Severity::Warning),
+    ("DOC015", Severity::Info),
 ];
 
 /// Which of the two parameter-doc roles the auto-sync engine cares about, independent of how

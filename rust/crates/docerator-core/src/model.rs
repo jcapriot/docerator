@@ -82,10 +82,11 @@ pub struct ParamSignature {
 pub struct MethodModel {
     pub docstring: Option<DocstringInfo>,
     pub signature: ParamSignature,
-    /// Directives from a `# docerator:` comment directly above this method (through its own
-    /// decorators, if any) — does NOT include the enclosing class's directives; merging class-
-    /// and method-level directives is `sync.rs`'s job, since only it knows which directives are
-    /// class-broadcast (`skip`) versus `__init__`-only (`override`, `style`).
+    /// Directives from `# docerator:` comment(s) between this method's own header and its body's
+    /// first real statement (trailing on the header's own line, and/or stacked on their own line
+    /// right above the docstring) — does NOT include the enclosing class's directives; merging
+    /// class- and method-level directives is `sync.rs`'s job, since only it knows which
+    /// directives are class-broadcast (`skip`) versus `__init__`-only (`override`, `style`).
     pub directives: Directives,
 }
 
@@ -93,7 +94,8 @@ pub struct MethodModel {
 pub struct ClassModel {
     pub base_refs: Vec<BaseRef>,
     pub methods: IndexMap<String, MethodModel>,
-    /// Directives from a `# docerator:` comment directly above the class itself.
+    /// Directives from `# docerator:` comment(s) between the class's own header and its body's
+    /// first real statement — see `MethodModel::directives` for the exact placement rules.
     pub directives: Directives,
     /// The `class` statement's own range — used to anchor diagnostics about its base classes.
     pub range: TextRange,
@@ -220,12 +222,10 @@ fn build_class_model(source: &str, class_def: &StmtClassDef, diagnostics: &mut V
         .unwrap_or_default();
 
     let class_docstring = leading_docstring(source, &class_def.body);
-    let class_anchor = class_def
-        .decorator_list
-        .first()
-        .map(|d| d.range().start())
-        .unwrap_or_else(|| class_def.range().start());
-    let class_directives = directives::resolve_directives_for(source, class_anchor, diagnostics);
+    let class_header_colon_end = class_header_colon_end(source, class_def);
+    let class_body_start = class_def.body.first().map(|s| s.range().start()).unwrap_or(class_header_colon_end);
+    let class_directives =
+        directives::resolve_directives_between(source, class_header_colon_end, class_body_start, diagnostics);
 
     let mut methods = IndexMap::new();
     for stmt in &class_def.body {
@@ -237,12 +237,15 @@ fn build_class_model(source: &str, class_def: &StmtClassDef, diagnostics: &mut V
                 own_doc
             };
             let signature = extract_signature(func_def);
-            let method_anchor = func_def
-                .decorator_list
-                .first()
-                .map(|d| d.range().start())
-                .unwrap_or_else(|| func_def.range().start());
-            let method_directives = directives::resolve_directives_for(source, method_anchor, diagnostics);
+            let method_header_colon_end = func_header_colon_end(source, func_def);
+            let method_body_start =
+                func_def.body.first().map(|s| s.range().start()).unwrap_or(method_header_colon_end);
+            let method_directives = directives::resolve_directives_between(
+                source,
+                method_header_colon_end,
+                method_body_start,
+                diagnostics,
+            );
             methods.insert(
                 func_def.name.to_string(),
                 MethodModel {
@@ -260,6 +263,52 @@ fn build_class_model(source: &str, class_def: &StmtClassDef, diagnostics: &mut V
         directives: class_directives,
         range: class_def.range(),
         own_docstring: class_docstring,
+    }
+}
+
+/// Byte offset right after a `class`/`def` header's own closing `:` — the boundary
+/// `directives::resolve_directives_between` anchors both its "trailing same-line" and "own-line
+/// stacked" scans against. Found by locating the first `:` at or after the last AST-covered piece
+/// of the header (name, type params, arguments/parameters, return annotation — whichever is
+/// present and comes last in source order): nothing else with a `:` can appear between there and
+/// the block's own colon (default values and annotations are already fully covered by their own
+/// node's range, so a dict-literal default like `x={1: 2}` never confuses this scan — the search
+/// only starts after the whole parameter list's range, past that colon too).
+fn class_header_colon_end(source: &str, class_def: &StmtClassDef) -> TextSize {
+    let mut end = class_def.name.range().end();
+    if let Some(type_params) = &class_def.type_params {
+        end = end.max(type_params.range().end());
+    }
+    if let Some(arguments) = &class_def.arguments {
+        end = end.max(arguments.range().end());
+    }
+    find_colon_end(source, end)
+}
+
+/// Same as `class_header_colon_end`, for a `def` statement's header (`def name[T](params) ->
+/// returns:`).
+fn func_header_colon_end(source: &str, func_def: &StmtFunctionDef) -> TextSize {
+    let mut end = func_def.name.range().end();
+    end = end.max(func_def.parameters.range().end());
+    if let Some(type_params) = &func_def.type_params {
+        end = end.max(type_params.range().end());
+    }
+    if let Some(returns) = &func_def.returns {
+        end = end.max(returns.range().end());
+    }
+    find_colon_end(source, end)
+}
+
+/// The byte offset right after the first `:` found at or after `from` — `from` is always
+/// positioned right past every part of the header a directive-value expression could itself
+/// contain a `:` in (see the two callers above), so the first `:` found really is the block's
+/// own. Falls back to `from` unchanged in the pathological case of no `:` at all (should not
+/// happen for a syntactically valid `class`/`def`).
+fn find_colon_end(source: &str, from: TextSize) -> TextSize {
+    let start = usize::from(from);
+    match source[start..].find(':') {
+        Some(rel) => TextSize::try_from(start + rel + 1).unwrap(),
+        None => from,
     }
 }
 

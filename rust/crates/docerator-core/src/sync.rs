@@ -1728,8 +1728,8 @@ class Base:
         pass
 
 
-# docerator: override=arg1
 class Child(Base):
+    # docerator: override=arg1
     \"\"\"Child.
 
     Parameters
@@ -1801,8 +1801,8 @@ class Base:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Base):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2039,8 +2039,8 @@ class Parent:
 
 
 class Child(Parent):
-    # docerator: skip
     def __init__(self, arg1):
+        # docerator: skip
         \"\"\"Child init.
 
         Parameters
@@ -2071,8 +2071,8 @@ class Parent:
         pass
 
 
-# docerator: skip
 class Child(Parent):
+    # docerator: skip
     \"\"\"Child.
 
     Parameters
@@ -2105,8 +2105,8 @@ class Grandparent:
         pass
 
 
-# docerator: override=arg1
 class Parent(Grandparent):
+    # docerator: override=arg1
     \"\"\"Parent.
 
     Parameters
@@ -2143,8 +2143,8 @@ class Child(Parent):
     #[test]
     fn unknown_style_directive_is_diagnosed_but_still_falls_back_to_numpydoc() {
         let source = "\
-# docerator: style=google
 class Solo:
+    # docerator: style=google
     \"\"\"Solo.
 
     Parameters
@@ -2201,8 +2201,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2240,8 +2240,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2283,8 +2283,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2317,8 +2317,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2362,9 +2362,9 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
-# docerator: exclude=extra1
 class Child(Parent):
+    # docerator: expand_kwargs
+    # docerator: exclude=extra1
     \"\"\"Child.
 
     Parameters
@@ -2378,7 +2378,10 @@ class Child(Parent):
 ";
         let (output, diagnostics) = sync(source);
         assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
-        let child_section = &output[output.find("class Child").unwrap()..];
+        // Scoped to the docstring's own content, not `output.find("class Child")` onward -- the
+        // latter would also match `exclude=extra1`'s own directive-comment text, which now sits
+        // inside the class body (between the header and the docstring) rather than above it.
+        let child_section = &output[output.find("\"\"\"Child.").unwrap()..];
         assert!(!child_section.contains("extra1"));
         assert!(child_section.contains("extra2"));
     }
@@ -2386,8 +2389,8 @@ class Child(Parent):
     #[test]
     fn expand_kwargs_without_var_keyword_is_diagnosed() {
         let source = "\
-# docerator: expand_kwargs
 class Solo:
+    # docerator: expand_kwargs
     \"\"\"Solo.
 
     Parameters
@@ -2423,8 +2426,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=parameters
 class Child(Parent):
+    # docerator: expand_kwargs=parameters
     \"\"\"Child.
 
     Parameters
@@ -2455,8 +2458,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=parameters
 class Child(Parent):
+    # docerator: expand_kwargs=parameters
     \"\"\"Child.
 
     Parameters
@@ -2492,8 +2495,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2526,8 +2529,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2569,8 +2572,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2610,8 +2613,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2653,8 +2656,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=parameters
 class Child(Parent):
+    # docerator: expand_kwargs=parameters
     \"\"\"Child.
 
     Parameters
@@ -2687,8 +2690,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=parameters
 class Child(Parent):
+    # docerator: expand_kwargs=parameters
     \"\"\"Child.
 
     Parameters
@@ -2726,8 +2729,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=parameters
 class Child(Parent):
+    # docerator: expand_kwargs=parameters
     \"\"\"Child.
 
     Parameters
@@ -2818,8 +2821,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2857,8 +2860,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -2901,8 +2904,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=parameters
 class Child(Parent):
+    # docerator: expand_kwargs=parameters
     \"\"\"Child.
 
     Parameters
@@ -2945,8 +2948,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=parameters
 class Child(Parent):
+    # docerator: expand_kwargs=parameters
     \"\"\"Child.
 
     Parameters
@@ -2996,8 +2999,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs
 class Child(Parent):
+    # docerator: expand_kwargs
     \"\"\"Child.
 
     Parameters
@@ -3038,8 +3041,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=parameters
 class Child(Parent):
+    # docerator: expand_kwargs=parameters
     \"\"\"Child.
 
     Parameters
@@ -3086,8 +3089,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=parameters
 class Child(Parent):
+    # docerator: expand_kwargs=parameters
     \"\"\"Child.
 
     Parameters
@@ -3126,8 +3129,8 @@ class Parent:
         pass
 
 
-# docerator: expand_kwargs=bogus
 class Child(Parent):
+    # docerator: expand_kwargs=bogus
     \"\"\"Child.
 
     Parameters
@@ -3467,8 +3470,8 @@ class Grandparent:
 
 
 
-# docerator: override=x
 class BranchA(Grandparent):
+    # docerator: override=x
     \"\"\"BranchA.
 
     Parameters
@@ -3565,8 +3568,8 @@ class Child(Exception):
     #[test]
     fn override_naming_a_non_signature_parameter_is_diagnosed() {
         let source = "\
-# docerator: override=not_a_real_param
 class Solo:
+    # docerator: override=not_a_real_param
     \"\"\"Solo.
 
     Parameters
@@ -3587,8 +3590,8 @@ class Solo:
     #[test]
     fn exclude_without_expand_kwargs_is_diagnosed() {
         let source = "\
-# docerator: exclude=arg2
 class Solo:
+    # docerator: exclude=arg2
     \"\"\"Solo.
 
     Parameters
@@ -3968,8 +3971,8 @@ class Grandparent:
         pass
 
 
-# docerator: skip
 class Parent(Grandparent):
+    # docerator: skip
     \"\"\"Parent.
 
     Parameters
@@ -4517,8 +4520,8 @@ class Base:
 
 
 
-# docerator: override=alpha_y
 class Child(Base):
+    # docerator: override=alpha_y
     \"\"\"Child.
 
     Parameters
